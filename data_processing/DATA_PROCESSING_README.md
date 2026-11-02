@@ -97,8 +97,33 @@ PDF 按页输出，PPT 按幻灯片输出，Excel 按工作表输出；Markdown�
 
 ## 文本分块
 
-`chunker.py` 将 `Document` 转换为 `Chunk`。所有策略都支持单文档、多文档和
+`chunker` 包将 `Document` 转换为 `Chunk`。所有策略都支持单文档、多文档和
 纯字符串输入，继承原始元数据，并生成可复现的 `chunk_id`。
+
+### 代码结构
+
+`chunker` 按职责拆分为包，每个公开策略类独立放在与类名同名的文件中：
+
+```text
+data_processing/chunker/
+├── __init__.py
+├── BaseChunker.py
+├── Chunk.py
+├── ChunkStrategy.py
+├── Chunker.py
+├── FixedSizeChunker.py
+├── RecursiveChunker.py
+├── SentenceWindowChunker.py
+├── ParagraphChunker.py
+├── MarkdownHeadingChunker.py
+├── ParentChildChunker.py
+├── _types.py
+└── _utils.py
+```
+
+`__init__.py` 统一导出公共 API，原有导入方式
+`from data_processing.chunker import Chunker` 保持不变；也可以按模块单独导入，
+例如 `from data_processing.chunker.RecursiveChunker import RecursiveChunker`。
 
 ### 内置策略
 
