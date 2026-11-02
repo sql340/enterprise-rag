@@ -94,3 +94,121 @@ openai-whisper）。生产环境建议通过 `ocr_handler` 和 `transcriber` 注
 
 PDF 按页输出，PPT 按幻灯片输出，Excel 按工作表输出；Markdown、Word 和单个
 图片则各输出一个 `Document`。
+
+## 文本分块
+
+`chunker.py` 将 `Document` 转换为 `Chunk`。所有策略都支持单文档、多文档和
+纯字符串输入，继承原始元数据，并生成可复现的 `chunk_id`。
+
+### 内置策略
+
+| 策略 | 名称 | 说明 | 推荐场景 |
+| --- | --- | --- | --- |
+| 固定长度 | `fixed` | 按字符或自定义长度单位切分，支持 overlap | 基线、日志、无明显结构的文本 |
+| 递归分块 | `recursive` | 按段落、换行、中英文句子、逗号等优先级递归切分 | 通用默认策略 |
+| 句子窗口 | `sentence_window` | 按中英文句子合并，可附带前后句窗口 | 问答、政策、新闻 |
+| 段落分块 | `paragraph` | 按自然段切分，过长段落自动递归拆分 | 报告、规范、书籍 |
+| Markdown 标题 | `markdown_heading` | 按 H1-H6 分块，保留标题路径，跳过代码围栏中的伪标题 | Markdown 知识库 |
+| 父子分层 | `parent_child` | 先生成父块，再在父块内生成子块，输出父子关系 | 企业 RAG 检索与上下文扩展 |
+
+所有策略默认按字符计数，并支持 `length_function` 注入 tokenizer 计数函数，
+实现 token-aware 分块。
+
+### 基础用法
+
+```python
+from data_processing.chunker import Chunker, chunk_documents
+from data_processing.data_reader import DataReader
+
+documents = DataReader().read("knowledge/demo.md")
+
+chunker = Chunker(
+    strategy="markdown_heading",
+    chunk_size=600,
+    chunk_overlap=80,
+)
+chunks = chunker.split(documents)
+
+for chunk in chunks:
+    print(chunk.chunk_id)
+    print(chunk.metadata["heading_path"])
+    print(chunk.content)
+
+# 一次性调用
+chunks = chunk_documents(documents, strategy="recursive", chunk_size=600)
+```
+
+`chunk_size` 的上限单位由 `length_function` 决定，默认是字符。`chunk_overlap`
+未显式传入时取 `min(64, chunk_size // 8)`，显式传入时必须小于
+`chunk_size`。`min_chunk_size` 用于尝试合并尾部过小的块。
+
+### Token 计数
+
+```python
+import tiktoken
+
+encoding = tiktoken.get_encoding("cl100k_base")
+
+chunker = Chunker(
+    "recursive",
+    chunk_size=512,
+    chunk_overlap=64,
+    length_function=lambda text: len(encoding.encode(text)),
+)
+chunks = chunker.split(documents)
+```
+
+### 句子窗口
+
+```python
+chunker = Chunker(
+    "sentence_window",
+    chunk_size=400,
+    chunk_overlap=50,
+    sentence_window=2,
+)
+chunks = chunker.split(documents)
+
+# 正文用于检索；window_content 可用于返回命中句子的上下文
+window_text = chunks[0].metadata.get("window_content")
+```
+
+### 父子分层
+
+```python
+chunker = Chunker(
+    "parent_child",
+    chunk_size=400,             # 子块大小
+    chunk_overlap=50,           # 子块 overlap
+    parent_chunk_size=1600,
+    parent_chunk_overlap=0,
+)
+chunks = chunker.split(documents)
+
+children = [chunk for chunk in chunks if chunk.chunk_role == "child"]
+parents_by_id = {
+    chunk.chunk_id: chunk for chunk in chunks if chunk.chunk_role == "parent"
+}
+
+# 检索 child，命中后按 parent_id 取父块
+parent = parents_by_id[children[0].parent_id]
+```
+
+### Chunk 元数据
+
+每个 `Chunk` 包含：
+
+- `content`、`chunk_id`、`document_id`、`chunk_index`、`char_start`、
+  `char_end`、`content_hash`、`parent_id`。
+- 原始 `Document` 元数据，例如 `source`、`page_number`、`sheet_name`。
+- `chunk_strategy`、`chunk_config_hash`、`chunk_role`、`chunk_role_index`、
+  `chunk_role_count`、`chunk_length` 和 `chunk_content_hash`。
+- Markdown 的 `heading_path`、`section_title`；句子策略的
+  `sentence_start_index`、`sentence_end_index`、`window_content`；段落策略的
+  `paragraph_start_index`、`paragraph_end_index`。
+- 父子策略的 `parent_index`、`parent_char_start`、`parent_char_end`、
+  `child_index`、`child_count`。
+
+`document_id` 由来源路径和规范化后的文档内容计算；`chunk_id` 还包含策略、
+分块配置、字符位置、正文哈希和父块 ID。因此同一内容在相同配置下重复处理
+会得到稳定 ID，配置变化时 ID 会同步变化，便于判断索引是否需要更新。
