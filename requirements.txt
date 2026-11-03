@@ -1,0 +1,9 @@
+# 数值计算
+numpy>=1.26,<3.0
+
+# 本地 Embedding 模型（默认 BAAI/bge-m3）
+sentence-transformers>=3.0,<6.0
+torch>=2.2
+
+# 向量数据库
+qdrant-client>=1.12,<2.0

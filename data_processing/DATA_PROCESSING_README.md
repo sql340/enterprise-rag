@@ -237,3 +237,207 @@ parent = parents_by_id[children[0].parent_id]
 `document_id` 由来源路径和规范化后的文档内容计算；`chunk_id` 还包含策略、
 分块配置、字符位置、正文哈希和父块 ID。因此同一内容在相同配置下重复处理
 会得到稳定 ID，配置变化时 ID 会同步变化，便于判断索引是否需要更新。
+
+## Embedding 与向量入库
+
+### 向量库选择
+
+默认选择 **Qdrant**：
+
+- 单容器即可部署，支持本地持久化和托管 Qdrant Cloud。
+- point ID 稳定，适合使用 `chunk_id` 做幂等 upsert。
+- 支持 payload 过滤，可按 `document_id`、`source`、`file_type`、
+  `chunk_role` 等字段缩小检索范围。
+- 支持按条件删除和 scroll，便于文件更新后清理旧版本向量。
+
+默认 Embedding 模型为 **`BAAI/bge-m3`**（1024 维）。它对中文、英文和多语言
+检索都有较好的效果，可以直接使用 sentence-transformers 加载。模型权重首次
+运行时会自动下载，不提交到仓库。
+
+### 安装与启动
+
+根目录的 `requirements.txt` 包含 Embedding 模型和 Qdrant 客户端依赖：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+使用 Docker 启动 Qdrant：
+
+```bash
+docker compose up -d qdrant
+```
+
+Qdrant 默认监听 `http://localhost:6333`。本地数据写入 `data/qdrant/`，该目录
+已在 `.gitignore` 中忽略。环境变量示例见根目录 `.env.example`；代码不会自动
+读取 `.env`，请通过部署环境、`source` 或容器编排注入。
+
+### 代码结构
+
+```text
+data_processing/
+└── knowledge_indexing/
+    ├── BaseEmbedding.py                    # Embedding 接口
+    ├── SentenceTransformerEmbedding.py     # 本地 bge-m3 等模型
+    ├── OpenAICompatibleEmbedding.py        # OpenAI 兼容服务
+    ├── EmbeddingError.py                   # Embedding 异常
+    ├── EmbeddingDependencyError.py         # 可选依赖异常
+    ├── create_embedding.py                 # Embedding 工厂函数
+    ├── _utils.py                           # 向量批次与结果校验
+    ├── IndexingResult.py                   # 入库结果
+    ├── KnowledgeIndexError.py              # 索引异常
+    ├── KnowledgeIndexer.py                 # 向量化、幂等入库与过期清理
+    └── __init__.py                         # 公共导出
+retrieval/
+└── vector_store/
+    ├── BaseVectorStore.py     # 向量库接口
+    ├── QdrantVectorStore.py   # Qdrant 实现
+    └── VectorSearchResult.py  # 检索结果
+```
+
+### 完整入库示例
+
+```python
+from data_processing.chunker import Chunker
+from data_processing.data_reader import DataReader
+from data_processing.knowledge_indexing import (
+    KnowledgeIndexer,
+    SentenceTransformerEmbedding,
+)
+from retrieval.vector_store import QdrantVectorStore
+
+embedding = SentenceTransformerEmbedding(
+    "BAAI/bge-m3",
+    device="auto",              # 自动选择 CPU / CUDA / MPS
+    batch_size=32,
+    normalize_embeddings=True,
+)
+
+store = QdrantVectorStore(
+    collection_name="enterprise_knowledge_bge_m3",
+    url="http://localhost:6333",
+)
+
+indexer = KnowledgeIndexer(
+    embedding,
+    store,
+    sync_scope="source",        # 按文件处理增量更新
+    delete_stale=True,
+)
+
+reader = DataReader()
+documents = reader.read_directory("knowledge", recursive=True)
+chunks = Chunker(
+    "markdown_heading",
+    chunk_size=600,
+    chunk_overlap=80,
+).split(documents)
+
+result = indexer.index_chunks(chunks)
+print(result.indexed_chunks)
+print(result.document_ids)
+print(result.sources)
+```
+
+`index_documents()` 是“分块 + 入库”的便捷入口：
+
+```python
+chunker = Chunker("recursive", chunk_size=600, chunk_overlap=80)
+result = indexer.index_documents(documents, chunker)
+```
+
+### 检索示例
+
+```python
+query_vector = embedding.embed_query("报销需要哪些材料？")
+
+hits = store.search(
+    query_vector,
+    limit=5,
+    filters={
+        "chunk_role": "child",
+        "file_type": "pdf",
+        "source": ["/knowledge/policy.pdf", "/knowledge/faq.pdf"],
+    },
+)
+
+for hit in hits:
+    print(hit.score)
+    print(hit.chunk_id, hit.document_id)
+    print(hit.content)
+    print(hit.payload["source"])
+```
+
+过滤值是标量时按等值匹配，是列表时按 `MatchAny` 匹配。复杂条件可以直接传入
+`qdrant_client.models.Filter`。
+
+父子分块策略会同时保存父块和子块。检索时过滤 `chunk_role="child"`，命中后
+可以通过 payload 中的 `parent_id` 取回父块作为更大的上下文：
+
+```python
+parents_by_id = {
+    chunk.chunk_id: chunk for chunk in chunks if chunk.chunk_role == "parent"
+}
+
+hit = store.search(embedding.embed_query("报销审批流程"), limit=1)[0]
+parent = parents_by_id[hit.payload["parent_id"]]
+context = parent.content
+```
+
+### 幂等更新与增量清理
+
+- 相同内容、相同分块配置会生成相同的 `chunk_id`，重复入库只是幂等 upsert，
+  不会产生重复向量。
+- 默认 `sync_scope="source"`：先写入同一来源的新块，再删除该 `source` 下本次
+  未出现的旧块。文件内容更新后，即使 `document_id` 变化，旧向量也会被清理。
+- 如果一次只重建一个文档版本或部分页面，应改为
+  `sync_scope="document"`，避免误删同一文件其它页面或版本的块。
+- 如果只更新部分块，可以设置 `delete_stale=False`，但需要自行调用
+  `delete_by_document()` 或 `delete_by_source()` 管理历史数据。
+- 空分块列表会被拒绝，避免把“处理失败或读取为空”误当成删除全部旧数据的信号。
+
+### 模型切换与维度
+
+不同 Embedding 模型的向量维度通常不同。Qdrant collection 创建后会校验维度，
+不一致时抛出 `CollectionDimensionMismatchError`。切换模型时请使用新的
+collection 名称，例如：
+
+```python
+store = QdrantVectorStore(
+    collection_name="enterprise_knowledge_text_embedding_3_large",
+)
+```
+
+### 使用企业 Embedding 服务
+
+如果企业已有 OpenAI 兼容的 Embedding 网关，可以使用
+`OpenAICompatibleEmbedding`，无需安装模型权重：
+
+```python
+from data_processing.knowledge_indexing import OpenAICompatibleEmbedding
+
+embedding = OpenAICompatibleEmbedding(
+    model_name="bge-m3",
+    base_url="http://embedding-gateway.internal/v1",
+    api_key="YOUR_API_KEY",
+    dimension=1024,
+    batch_size=64,
+)
+```
+
+使用 E5 等需要指令前缀的模型时，可传入 `query_prefix="query: "` 和
+`document_prefix="passage: "`。默认的 bge-m3 不需要额外前缀。
+
+### 主要 payload 字段
+
+每个 Qdrant point 会保留 Chunk 元数据，并补充以下常用字段：
+
+`chunk_id`、`document_id`、`content`、`source`、`file_name`、`file_type`、
+`page_number`、`slide_number`、`sheet_name`、`chunk_index`、
+`chunk_strategy`、`chunk_role`、`parent_id`、`content_hash`、
+`embedding_model`。
+
+`document_id`、`source`、`file_name`、`file_type`、`chunk_strategy`、
+`chunk_role` 和 `embedding_model` 会创建 keyword payload 索引。
