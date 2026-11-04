@@ -7,3 +7,8 @@ torch>=2.2
 
 # 向量数据库
 qdrant-client>=1.12,<2.0
+
+# HTTP API 与流式 LLM 调用
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.27,<1.0
