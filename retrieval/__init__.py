@@ -4,6 +4,7 @@ from .KnowledgeRetriever import KnowledgeRetriever
 from .PromptBuilder import DEFAULT_SYSTEM_PROMPT, PromptBuilder
 from .RagQueryService import RagQueryService
 from .RagStreamEvent import RagStreamEvent
+from .RrfFusion import RrfFusion
 from .vector_store import (
     BaseVectorStore,
     CollectionDimensionMismatchError,
@@ -23,6 +24,7 @@ __all__ = [
     "QdrantVectorStore",
     "RagQueryService",
     "RagStreamEvent",
+    "RrfFusion",
     "VectorSearchResult",
     "VectorStoreError",
 ]

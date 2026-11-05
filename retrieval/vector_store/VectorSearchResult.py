@@ -11,6 +11,9 @@ class VectorSearchResult:
     id: str
     score: float
     payload: dict[str, Any] = field(default_factory=dict)
+    retrieval_mode: str = "dense"
+    route_scores: dict[str, float] = field(default_factory=dict)
+    route_ranks: dict[str, int] = field(default_factory=dict)
 
     @property
     def content(self) -> str:
@@ -33,6 +36,9 @@ class VectorSearchResult:
             "id": self.id,
             "score": self.score,
             "payload": dict(self.payload),
+            "retrieval_mode": self.retrieval_mode,
+            "route_scores": dict(self.route_scores),
+            "route_ranks": dict(self.route_ranks),
         }
 
 

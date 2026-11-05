@@ -81,6 +81,8 @@ class RagSettings:
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
     qdrant_collection: str = "enterprise_knowledge_bge_m3"
+    qdrant_text_index_field: str = "content"
+    qdrant_enable_text_index: bool = True
 
     embedding_provider: str = "sentence_transformers"
     embedding_model: str = "BAAI/bge-m3"
@@ -103,6 +105,12 @@ class RagSettings:
     rag_top_k: int = 5
     rag_score_threshold: float | None = None
     rag_max_context_chars: int = 12000
+    rag_retrieval_mode: str = "hybrid"
+    rag_candidate_multiplier: int = 4
+    rag_max_candidates: int = 100
+    rag_rrf_k: int = 60
+    rag_dense_weight: float = 1.0
+    rag_keyword_weight: float = 0.8
 
     api_title: str = "Enterprise RAG API"
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
@@ -121,6 +129,8 @@ class RagSettings:
             raise ValueError(f"不支持的 EMBEDDING_PROVIDER: {self.embedding_provider}")
         if not self.qdrant_collection.strip():
             raise ValueError("QDRANT_COLLECTION 不能为空")
+        if not self.qdrant_text_index_field.strip():
+            raise ValueError("QDRANT_TEXT_INDEX_FIELD 不能为空")
         if self.embedding_batch_size <= 0:
             raise ValueError("EMBEDDING_BATCH_SIZE 必须为正整数")
         if self.embedding_dimension is not None and self.embedding_dimension <= 0:
@@ -141,6 +151,21 @@ class RagSettings:
             raise ValueError("RAG_SCORE_THRESHOLD 必须在 -1 到 1 之间")
         if self.rag_max_context_chars <= 0:
             raise ValueError("RAG_MAX_CONTEXT_CHARS 必须为正整数")
+        retrieval_mode = (
+            self.rag_retrieval_mode.strip().lower().replace("-", "_")
+        )
+        if retrieval_mode not in {"dense", "hybrid", "multi_route"}:
+            raise ValueError("RAG_RETRIEVAL_MODE 必须是 dense 或 hybrid")
+        if self.rag_candidate_multiplier <= 0:
+            raise ValueError("RAG_CANDIDATE_MULTIPLIER 必须为正整数")
+        if self.rag_max_candidates <= 0:
+            raise ValueError("RAG_MAX_CANDIDATES 必须为正整数")
+        if self.rag_rrf_k <= 0:
+            raise ValueError("RAG_RRF_K 必须为正整数")
+        if self.rag_dense_weight < 0 or self.rag_keyword_weight < 0:
+            raise ValueError("检索路权重不能为负数")
+        if self.rag_dense_weight == 0 and self.rag_keyword_weight == 0:
+            raise ValueError("dense 和 keyword 权重不能同时为 0")
 
     @classmethod
     def from_env(cls) -> "RagSettings":
@@ -150,6 +175,8 @@ class RagSettings:
             qdrant_collection=_env(
                 "QDRANT_COLLECTION", "enterprise_knowledge_bge_m3"
             ),
+            qdrant_text_index_field=_env("QDRANT_TEXT_INDEX_FIELD", "content"),
+            qdrant_enable_text_index=_env_bool("QDRANT_ENABLE_TEXT_INDEX", True),
             embedding_provider=_env(
                 "EMBEDDING_PROVIDER", "sentence_transformers"
             ),
@@ -173,6 +200,12 @@ class RagSettings:
             rag_top_k=_env_int("RAG_TOP_K", 5),
             rag_score_threshold=_env_optional_float("RAG_SCORE_THRESHOLD"),
             rag_max_context_chars=_env_int("RAG_MAX_CONTEXT_CHARS", 12000),
+            rag_retrieval_mode=_env("RAG_RETRIEVAL_MODE", "hybrid"),
+            rag_candidate_multiplier=_env_int("RAG_CANDIDATE_MULTIPLIER", 4),
+            rag_max_candidates=_env_int("RAG_MAX_CANDIDATES", 100),
+            rag_rrf_k=_env_int("RAG_RRF_K", 60),
+            rag_dense_weight=_env_float("RAG_DENSE_WEIGHT", 1.0),
+            rag_keyword_weight=_env_float("RAG_KEYWORD_WEIGHT", 0.8),
             api_title=_env("API_TITLE", "Enterprise RAG API"),
             cors_origins=_env_list("API_CORS_ORIGINS"),
         )

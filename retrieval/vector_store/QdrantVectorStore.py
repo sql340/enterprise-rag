@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import uuid
 from collections.abc import Mapping, Sequence
@@ -21,6 +22,9 @@ except ImportError as exc:  # pragma: no cover - 由构造时给出安装提示
     _QDRANT_IMPORT_ERROR: ImportError | None = exc
 else:
     _QDRANT_IMPORT_ERROR = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreError(RuntimeError):
@@ -68,6 +72,8 @@ class QdrantVectorStore(BaseVectorStore):
         on_disk_payload: 是否将 payload 存储在磁盘上。
         create_payload_indexes: 是否创建常用过滤字段索引。
         batch_size: 单次 upsert 的点数量。
+        text_index_field: 开启 BM25 评分的 payload 文本字段。
+        enable_text_index: 是否创建 BM25 文本索引。
     """
 
     DEFAULT_PAYLOAD_INDEXES = (
@@ -95,6 +101,8 @@ class QdrantVectorStore(BaseVectorStore):
         create_payload_indexes: bool = True,
         batch_size: int = 128,
         payload_index_fields: Sequence[str] | None = None,
+        text_index_field: str = "content",
+        enable_text_index: bool = True,
         **client_kwargs: Any,
     ) -> None:
         if QdrantClient is None or models is None:
@@ -107,6 +115,8 @@ class QdrantVectorStore(BaseVectorStore):
             raise ValueError("batch_size 必须为正整数")
         if timeout <= 0:
             raise ValueError("timeout 必须为正数")
+        if not text_index_field.strip():
+            raise ValueError("text_index_field 不能为空")
 
         self.collection_name = collection_name
         self.distance = self._resolve_distance(distance)
@@ -116,6 +126,9 @@ class QdrantVectorStore(BaseVectorStore):
         self.payload_index_fields = tuple(
             payload_index_fields or self.DEFAULT_PAYLOAD_INDEXES
         )
+        self.text_index_field = text_index_field
+        self.enable_text_index = enable_text_index
+        self._text_index_available = enable_text_index
         self._owns_client = client is None
         self._dimension: int | None = None
         self._collection_verified = False
@@ -140,6 +153,10 @@ class QdrantVectorStore(BaseVectorStore):
     @property
     def dimension(self) -> int | None:
         return self._dimension
+
+    @property
+    def supports_text_search(self) -> bool:
+        return self._text_index_available
 
     @staticmethod
     def _resolve_distance(distance: str) -> Any:
@@ -211,6 +228,25 @@ class QdrantVectorStore(BaseVectorStore):
                 field_schema=models.PayloadSchemaType.KEYWORD,
                 wait=True,
             )
+        if self.enable_text_index:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=self.text_index_field,
+                    field_schema=models.TextIndexParams(
+                        type=models.TextIndexType.TEXT,
+                        tokenizer=models.TokenizerType.MULTILINGUAL,
+                        lowercase=True,
+                        scoring=True,
+                    ),
+                    wait=True,
+                )
+            except Exception as exc:
+                self._text_index_available = False
+                logger.warning(
+                    "创建 Qdrant BM25 文本索引失败，hybrid 将回退 dense: %s",
+                    exc,
+                )
         self._payload_indexes_ready = True
 
     def upsert_chunks(
@@ -295,6 +331,7 @@ class QdrantVectorStore(BaseVectorStore):
         embedding_model: str,
         scope: str = "source",
         delete_stale: bool = True,
+        expected_chunk_ids: Sequence[str] | None = None,
     ) -> int:
         chunk_values = list(chunks)
         if not chunk_values:
@@ -309,19 +346,16 @@ class QdrantVectorStore(BaseVectorStore):
         if not delete_stale:
             return indexed
 
-        expected_chunk_ids = {chunk.chunk_id for chunk in chunk_values}
-        existing_chunk_ids = self._scroll_chunk_ids(scope_field, scope_value)
-        stale_chunk_ids = existing_chunk_ids - expected_chunk_ids
-        if stale_chunk_ids:
-            stale_point_ids = [
-                self.point_id_for_chunk(chunk_id)
-                for chunk_id in sorted(stale_chunk_ids)
-            ]
-            self.client.delete(
-                collection_name=self.collection_name,
-                points_selector=stale_point_ids,
-                wait=True,
-            )
+        active_chunk_ids = (
+            list(expected_chunk_ids)
+            if expected_chunk_ids is not None
+            else [chunk.chunk_id for chunk in chunk_values]
+        )
+        self.prune_stale_chunks(
+            scope_field=scope_field,
+            scope_value=scope_value,
+            expected_chunk_ids=active_chunk_ids,
+        )
         return indexed
 
     @staticmethod
@@ -347,15 +381,28 @@ class QdrantVectorStore(BaseVectorStore):
         return field_name, next(iter(values))
 
     def _scroll_chunk_ids(self, field_name: str, value: str) -> set[str]:
+        return set(self.list_chunk_records(scope_field=field_name, scope_value=value))
+
+    def list_chunk_records(
+        self,
+        *,
+        scope_field: str,
+        scope_value: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not scope_field.strip() or not scope_value:
+            raise ValueError("scope_field 和 scope_value 不能为空")
+        if not self.client.collection_exists(self.collection_name):
+            return {}
+
         scroll_filter = models.Filter(
             must=[
                 models.FieldCondition(
-                    key=field_name,
-                    match=models.MatchValue(value=value),
+                    key=scope_field,
+                    match=models.MatchValue(value=scope_value),
                 )
             ]
         )
-        chunk_ids: set[str] = set()
+        records_by_chunk_id: dict[str, dict[str, Any]] = {}
         offset: Any = None
         while True:
             records, offset = self.client.scroll(
@@ -363,15 +410,46 @@ class QdrantVectorStore(BaseVectorStore):
                 scroll_filter=scroll_filter,
                 limit=256,
                 offset=offset,
-                with_payload=["chunk_id"],
+                with_payload=["chunk_id", "embedding_model", "content_hash"],
                 with_vectors=False,
             )
             for record in records:
                 payload = record.payload or {}
                 if payload.get("chunk_id"):
-                    chunk_ids.add(str(payload["chunk_id"]))
+                    records_by_chunk_id[str(payload["chunk_id"])] = dict(payload)
             if offset is None:
-                return chunk_ids
+                return records_by_chunk_id
+
+    def prune_stale_chunks(
+        self,
+        *,
+        scope_field: str,
+        scope_value: str,
+        expected_chunk_ids: Sequence[str],
+    ) -> int:
+        expected = {str(chunk_id) for chunk_id in expected_chunk_ids}
+        if not expected:
+            raise ValueError("expected_chunk_ids 不能为空，避免误删整个同步范围")
+        existing = set(
+            self.list_chunk_records(
+                scope_field=scope_field,
+                scope_value=scope_value,
+            )
+        )
+        stale_chunk_ids = existing - expected
+        if not stale_chunk_ids:
+            return 0
+
+        stale_point_ids = [
+            self.point_id_for_chunk(chunk_id)
+            for chunk_id in sorted(stale_chunk_ids)
+        ]
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=stale_point_ids,
+            wait=True,
+        )
+        return len(stale_point_ids)
 
     def search(
         self,
@@ -432,6 +510,50 @@ class QdrantVectorStore(BaseVectorStore):
                 payload=dict(point.payload or {}),
             )
             for point in points
+        ]
+
+    def text_search(
+        self,
+        query_text: str,
+        *,
+        limit: int = 5,
+        filters: Mapping[str, Any] | Any | None = None,
+    ) -> list[VectorSearchResult]:
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("query_text 不能为空")
+        if limit <= 0:
+            raise ValueError("limit 必须为正整数")
+        if not self._text_index_available:
+            raise NotImplementedError("Qdrant 文本索引未启用")
+        if not self.client.collection_exists(self.collection_name):
+            raise VectorStoreError(
+                f"Qdrant collection 不存在: {self.collection_name!r}"
+            )
+
+        try:
+            response = self.client.query_points(
+                collection_name=self.collection_name,
+                query=models.TextQuery(text=query_text.strip()),
+                using=self.text_index_field,
+                limit=limit,
+                query_filter=self._build_filter(filters),
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Qdrant BM25 检索 {self.collection_name!r} 失败: {exc}"
+            ) from exc
+
+        return [
+            VectorSearchResult(
+                id=str(point.id),
+                score=float(point.score),
+                payload=dict(point.payload or {}),
+                retrieval_mode="keyword",
+                route_scores={"keyword": float(point.score)},
+            )
+            for point in response.points
         ]
 
     def _load_collection_dimension(self) -> int | None:

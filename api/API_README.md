@@ -95,12 +95,18 @@ data: {"finish_reason":"stop","elapsed_ms":1832.4}
 | `score_threshold` | number | 最低相似度分数，默认取 `RAG_SCORE_THRESHOLD` |
 | `filters` | object | Qdrant payload 过滤条件，值可为标量或数组 |
 | `include_sources` | boolean | 是否发送 `sources` 事件，默认 true |
+| `retrieval_mode` | string | `hybrid` 或 `dense`，默认取 `RAG_RETRIEVAL_MODE` |
 | `temperature` | number | 覆盖 LLM 温度，范围 0 到 2 |
 | `max_tokens` | integer | 覆盖最大生成 token 数 |
 
 常用过滤字段包括 `document_id`、`source`、`file_type`、`chunk_strategy`、
 `chunk_role` 和 `embedding_model`。父子分块场景通常过滤
 `chunk_role=child`。
+
+默认使用 `hybrid`：dense 向量召回和 Qdrant BM25 文本召回各取候选，再通过
+RRF 融合。融合结果的 `score` 是 RRF 排名分，不是余弦相似度；`sources`
+事件会同时返回 `retrieval_mode`、`route_scores` 以及每路原始分数。文本索引
+不可用或旧 collection 尚未重建时，会自动回退到 dense 检索。
 
 ## Python 客户端
 

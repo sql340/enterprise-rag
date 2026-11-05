@@ -24,12 +24,10 @@
 
 ### 安装依赖
 
-按实际使用的文件类型安装即可，缺失依赖时会抛出带安装提示的
-`OptionalDependencyError`：
+根目录的 `requirements.txt` 已包含所有 Python 解析依赖：
 
 ```bash
-pip install pypdf pdfplumber pymupdf python-docx python-pptx openpyxl xlrd
-pip install pillow pytesseract faster-whisper
+pip install -r requirements.txt
 ```
 
 此外还需要系统级命令：
@@ -37,6 +35,15 @@ pip install pillow pytesseract faster-whisper
 - `tesseract`：图片和扫描版 PDF 的 OCR。
 - `ffmpeg` / `ffprobe`：音视频信息读取、音频提取和转写。
 - `libreoffice` / `soffice`：`.doc`、`.ppt`、`.xls`、`.ods` 的格式转换。
+
+macOS 可以使用：
+
+```bash
+brew install tesseract tesseract-lang ffmpeg
+brew install --cask libreoffice
+```
+
+缺失依赖时会抛出带安装提示的 `OptionalDependencyError`。
 
 ### 基础用法
 
@@ -390,6 +397,9 @@ context = parent.content
 
 - 相同内容、相同分块配置会生成相同的 `chunk_id`，重复入库只是幂等 upsert，
   不会产生重复向量。
+- 默认 `skip_existing=True`：同一 Embedding 模型下，`chunk_id` 和
+  `content_hash` 未变化的块不会再次调用 Embedding；需要强制重建时传入
+  `force_reindex=True`。
 - 默认 `sync_scope="source"`：先写入同一来源的新块，再删除该 `source` 下本次
   未出现的旧块。文件内容更新后，即使 `document_id` 变化，旧向量也会被清理。
 - 如果一次只重建一个文档版本或部分页面，应改为
@@ -441,3 +451,6 @@ embedding = OpenAICompatibleEmbedding(
 
 `document_id`、`source`、`file_name`、`file_type`、`chunk_strategy`、
 `chunk_role` 和 `embedding_model` 会创建 keyword payload 索引。
+
+`content` 字段会额外创建支持 BM25 评分的 multilingual 文本索引，用于在线
+hybrid 检索。Qdrant 服务端版本需要与仓库中的 `v1.20.0` 保持一致或兼容。

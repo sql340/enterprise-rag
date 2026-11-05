@@ -51,6 +51,7 @@ async def _stream_events(
             score_threshold=payload.score_threshold,
             filters=payload.filters,
             include_sources=payload.include_sources,
+            retrieval_mode=payload.retrieval_mode,
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
         ):
