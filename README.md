@@ -30,3 +30,6 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 
 在线接口、SSE 事件协议和客户端示例见
 [`api/API_README.md`](api/API_README.md)。
+
+知识质量、权限分级和入库控制台的设计方案见
+[`docs/KNOWLEDGE_GOVERNANCE.md`](docs/KNOWLEDGE_GOVERNANCE.md)。

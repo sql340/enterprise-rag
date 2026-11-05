@@ -56,6 +56,7 @@ class RagQueryService:
         score_threshold: float | None = None,
         filters: Mapping[str, Any] | None = None,
         include_sources: bool = True,
+        retrieval_mode: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[RagStreamEvent]:
@@ -97,6 +98,7 @@ class RagQueryService:
             top_k=resolved_top_k,
             score_threshold=resolved_score_threshold,
             filters=filters,
+            retrieval_mode=retrieval_mode,
         )
         if include_sources:
             yield RagStreamEvent(
@@ -157,6 +159,8 @@ class RagQueryService:
             "slide_number": payload.get("slide_number"),
             "sheet_name": payload.get("sheet_name"),
             "heading_path": payload.get("heading_path"),
+            "retrieval_mode": source.retrieval_mode,
+            "route_scores": source.route_scores,
             "content": source.content,
         }
 

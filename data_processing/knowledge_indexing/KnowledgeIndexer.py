@@ -24,6 +24,8 @@ class KnowledgeIndexer:
         sync_scope: ``source`` 或 ``document``。按文件更新用 ``source``；
             只处理单个文档版本或部分页面时用 ``document``。
         delete_stale: 是否删除同步范围内本次未写入的旧块。
+        skip_existing: 是否跳过同一模型中 chunk_id 与 content_hash 均未变化
+            的知识块，避免重复 Embedding。
     """
 
     def __init__(
@@ -33,11 +35,13 @@ class KnowledgeIndexer:
         *,
         sync_scope: str = "source",
         delete_stale: bool = True,
+        skip_existing: bool = True,
     ) -> None:
         self.embedding = embedding
         self.vector_store = vector_store
         self.sync_scope = self._normalise_scope(sync_scope)
         self.delete_stale = delete_stale
+        self.skip_existing = skip_existing
 
     def index_chunks(
         self,
@@ -45,6 +49,7 @@ class KnowledgeIndexer:
         *,
         sync_scope: str | None = None,
         delete_stale: bool | None = None,
+        force_reindex: bool | None = None,
     ) -> IndexingResult:
         """向量化并幂等写入知识块。"""
 
@@ -58,33 +63,56 @@ class KnowledgeIndexer:
         should_delete_stale = (
             self.delete_stale if delete_stale is None else delete_stale
         )
+        should_skip_existing = (
+            self.skip_existing if force_reindex is None else not force_reindex
+        )
         groups = self._group_chunks(values, scope)
-        indexed = 0
-        collection_ready = False
+        embedded = 0
+        skipped = 0
+        stale_deleted = 0
 
         for (scope_field, scope_value), group_chunks in groups.items():
-            vectors = self.embedding.embed_documents(
-                [chunk.content for chunk in group_chunks]
-            )
-            if not vectors:
-                raise KnowledgeIndexError(
-                    f"Embedding 未返回向量: {scope_field}={scope_value}"
+            existing = (
+                self.vector_store.list_chunk_records(
+                    scope_field=scope_field,
+                    scope_value=scope_value,
                 )
-            if not collection_ready:
-                self.vector_store.ensure_collection(len(vectors[0]))
-                collection_ready = True
-
-            store_scope = "source" if scope_field == "source" else "document"
-            indexed += self.vector_store.sync_chunks(
-                group_chunks,
-                vectors,
-                embedding_model=self.embedding.model_name,
-                scope=store_scope,
-                delete_stale=should_delete_stale,
+                if should_skip_existing
+                else {}
             )
+            to_embed = [
+                chunk
+                for chunk in group_chunks
+                if not self._is_unchanged(
+                    chunk,
+                    existing.get(chunk.chunk_id),
+                )
+            ]
+            skipped += len(group_chunks) - len(to_embed)
+
+            if to_embed:
+                vectors = self.embedding.embed_documents(
+                    [chunk.content for chunk in to_embed]
+                )
+                if not vectors:
+                    raise KnowledgeIndexError(
+                        f"Embedding 未返回向量: {scope_field}={scope_value}"
+                    )
+                embedded += self.vector_store.upsert_chunks(
+                    to_embed,
+                    vectors,
+                    embedding_model=self.embedding.model_name,
+                )
+
+            if should_delete_stale:
+                stale_deleted += self.vector_store.prune_stale_chunks(
+                    scope_field=scope_field,
+                    scope_value=scope_value,
+                    expected_chunk_ids=[chunk.chunk_id for chunk in group_chunks],
+                )
 
         return IndexingResult(
-            indexed_chunks=indexed,
+            indexed_chunks=embedded,
             document_ids=tuple(sorted({chunk.document_id for chunk in values})),
             sources=tuple(
                 sorted(
@@ -96,6 +124,10 @@ class KnowledgeIndexer:
                 )
             ),
             collection_name=self._collection_name,
+            total_chunks=len(values),
+            embedded_chunks=embedded,
+            skipped_chunks=skipped,
+            stale_deleted=stale_deleted,
         )
 
     def index_documents(
@@ -111,6 +143,18 @@ class KnowledgeIndexer:
     @property
     def _collection_name(self) -> str:
         return str(getattr(self.vector_store, "collection_name", ""))
+
+    def _is_unchanged(
+        self,
+        chunk: Chunk,
+        existing: dict[str, Any] | None,
+    ) -> bool:
+        if not existing:
+            return False
+        return (
+            str(existing.get("embedding_model") or "") == self.embedding.model_name
+            and str(existing.get("content_hash") or "") == chunk.content_hash
+        )
 
     @staticmethod
     def _normalise_scope(scope: str) -> str:

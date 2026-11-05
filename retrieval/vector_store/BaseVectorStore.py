@@ -35,6 +35,7 @@ class BaseVectorStore(ABC):
         embedding_model: str,
         scope: str = "source",
         delete_stale: bool = True,
+        expected_chunk_ids: Sequence[str] | None = None,
     ) -> int:
         """写入新向量，并可选删除同一来源下已经过期的知识块。"""
 
@@ -48,6 +49,44 @@ class BaseVectorStore(ABC):
         filters: Mapping[str, Any] | None = None,
     ) -> list[VectorSearchResult]:
         """执行向量相似度检索。"""
+
+    @property
+    def supports_text_search(self) -> bool:
+        """是否支持基于 payload 文本索引的 BM25 检索。"""
+
+        return False
+
+    def text_search(
+        self,
+        query_text: str,
+        *,
+        limit: int = 5,
+        filters: Mapping[str, Any] | None = None,
+    ) -> list[VectorSearchResult]:
+        """执行 BM25 文本检索；不支持的实现应保持默认异常。"""
+
+        raise NotImplementedError("当前向量库不支持 BM25 文本检索")
+
+    def list_chunk_records(
+        self,
+        *,
+        scope_field: str,
+        scope_value: str,
+    ) -> dict[str, dict[str, Any]]:
+        """返回同步范围内 chunk_id 到关键 payload 的映射。"""
+
+        raise NotImplementedError("当前向量库不支持按范围读取知识块")
+
+    def prune_stale_chunks(
+        self,
+        *,
+        scope_field: str,
+        scope_value: str,
+        expected_chunk_ids: Sequence[str],
+    ) -> int:
+        """删除同步范围内不在预期 chunk_id 集合中的旧块。"""
+
+        raise NotImplementedError("当前向量库不支持清理过期知识块")
 
     @abstractmethod
     def delete_by_document(self, document_id: str) -> None:

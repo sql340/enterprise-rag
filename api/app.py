@@ -33,6 +33,8 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
         url=settings.qdrant_url,
         api_key=settings.qdrant_api_key,
         create_payload_indexes=False,
+        text_index_field=settings.qdrant_text_index_field,
+        enable_text_index=settings.qdrant_enable_text_index,
     )
     llm = OpenAICompatibleLLM(
         model_name=settings.llm_model,
@@ -41,7 +43,16 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
         timeout=settings.llm_timeout,
     )
     return RagQueryService(
-        KnowledgeRetriever(embedding, vector_store),
+        KnowledgeRetriever(
+            embedding,
+            vector_store,
+            retrieval_mode=settings.rag_retrieval_mode,
+            candidate_multiplier=settings.rag_candidate_multiplier,
+            max_candidates=settings.rag_max_candidates,
+            rrf_k=settings.rag_rrf_k,
+            dense_weight=settings.rag_dense_weight,
+            keyword_weight=settings.rag_keyword_weight,
+        ),
         llm,
         PromptBuilder(max_context_chars=settings.rag_max_context_chars),
         default_top_k=settings.rag_top_k,
