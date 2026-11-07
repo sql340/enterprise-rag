@@ -313,6 +313,7 @@ from data_processing.knowledge_indexing import (
     KnowledgeIndexer,
     SentenceTransformerEmbedding,
 )
+from access_control import Classification, DocumentAcl
 from retrieval.vector_store import QdrantVectorStore
 
 embedding = SentenceTransformerEmbedding(
@@ -342,7 +343,13 @@ chunks = Chunker(
     chunk_overlap=80,
 ).split(documents)
 
-result = indexer.index_chunks(chunks)
+acl = DocumentAcl(
+    tenant_id="tenant-a",
+    classification=Classification.INTERNAL,
+    allowed_roles=frozenset({"finance"}),
+    owner_id="user-1",
+)
+result = indexer.index_chunks(chunks, acl=acl)
 print(result.indexed_chunks)
 print(result.document_ids)
 print(result.sources)
@@ -354,6 +361,25 @@ print(result.sources)
 chunker = Chunker("recursive", chunk_size=600, chunk_overlap=80)
 result = indexer.index_documents(documents, chunker)
 ```
+
+启用在线 ACL 后，所有新知识都必须带 `DocumentAcl` 入库。ACL 会复制到每个知识块
+的 payload，检索时由服务端强制过滤。修改权限时优先使用：
+
+```python
+indexer.update_acl_by_document(
+    result.document_ids[0],
+    DocumentAcl(
+        tenant_id="tenant-a",
+        classification=Classification.CONFIDENTIAL,
+        allowed_groups=frozenset({"audit"}),
+        owner_id="user-1",
+        acl_version=2,
+    ),
+)
+```
+
+这个操作只更新 payload，不重新计算向量。ACL 启用前入库、没有 ACL payload 的
+旧知识块默认不可见，需要补齐权限后重新入库。
 
 ### 检索示例
 

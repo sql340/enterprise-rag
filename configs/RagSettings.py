@@ -111,6 +111,8 @@ class RagSettings:
     rag_rrf_k: int = 60
     rag_dense_weight: float = 1.0
     rag_keyword_weight: float = 0.8
+    rag_acl_enabled: bool = True
+    rag_acl_proxy_token: str | None = None
 
     api_title: str = "Enterprise RAG API"
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
@@ -206,6 +208,8 @@ class RagSettings:
             rag_rrf_k=_env_int("RAG_RRF_K", 60),
             rag_dense_weight=_env_float("RAG_DENSE_WEIGHT", 1.0),
             rag_keyword_weight=_env_float("RAG_KEYWORD_WEIGHT", 0.8),
+            rag_acl_enabled=_env_bool("RAG_ACL_ENABLED", True),
+            rag_acl_proxy_token=_env_optional("RAG_ACL_PROXY_TOKEN"),
             api_title=_env("API_TITLE", "Enterprise RAG API"),
             cors_origins=_env_list("API_CORS_ORIGINS"),
         )

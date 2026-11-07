@@ -84,7 +84,19 @@ class QdrantVectorStore(BaseVectorStore):
         "chunk_strategy",
         "chunk_role",
         "embedding_model",
+        "tenant_id",
+        "classification",
+        "allowed_roles",
+        "allowed_groups",
+        "allowed_users",
+        "owner_id",
+        "document_status",
+        "acl_version",
     )
+    PAYLOAD_INDEX_TYPES = {
+        "classification": "integer",
+        "acl_version": "integer",
+    }
 
     def __init__(
         self,
@@ -222,10 +234,16 @@ class QdrantVectorStore(BaseVectorStore):
         if self._payload_indexes_ready or not self.create_payload_indexes:
             return
         for field_name in self.payload_index_fields:
+            index_type = self.PAYLOAD_INDEX_TYPES.get(field_name, "keyword")
+            field_schema = (
+                models.PayloadSchemaType.INTEGER
+                if index_type == "integer"
+                else models.PayloadSchemaType.KEYWORD
+            )
             self.client.create_payload_index(
                 collection_name=self.collection_name,
                 field_name=field_name,
-                field_schema=models.PayloadSchemaType.KEYWORD,
+                field_schema=field_schema,
                 wait=True,
             )
         if self.enable_text_index:
@@ -410,7 +428,19 @@ class QdrantVectorStore(BaseVectorStore):
                 scroll_filter=scroll_filter,
                 limit=256,
                 offset=offset,
-                with_payload=["chunk_id", "embedding_model", "content_hash"],
+                with_payload=[
+                    "chunk_id",
+                    "embedding_model",
+                    "content_hash",
+                    "tenant_id",
+                    "classification",
+                    "allowed_roles",
+                    "allowed_groups",
+                    "allowed_users",
+                    "owner_id",
+                    "document_status",
+                    "acl_version",
+                ],
                 with_vectors=False,
             )
             for record in records:
@@ -450,6 +480,31 @@ class QdrantVectorStore(BaseVectorStore):
             wait=True,
         )
         return len(stale_point_ids)
+
+    def update_payload_by_document(
+        self,
+        document_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if not document_id:
+            raise ValueError("document_id 不能为空")
+        if not payload:
+            raise ValueError("payload 不能为空")
+        if not self.client.collection_exists(self.collection_name):
+            return
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            payload=_json_safe(dict(payload)),
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchValue(value=document_id),
+                    )
+                ]
+            ),
+            wait=True,
+        )
 
     def search(
         self,
@@ -596,6 +651,19 @@ class QdrantVectorStore(BaseVectorStore):
                     )
                 )
         return models.Filter(must=conditions) if conditions else None
+
+    def merge_filters(self, *filters: Any) -> Any:
+        values = [
+            self._build_filter(value)
+            for value in filters
+            if value is not None
+        ]
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return models.Filter(must=values)
 
     def delete_by_document(self, document_id: str) -> None:
         if not document_id:

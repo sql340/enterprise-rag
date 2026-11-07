@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Mapping
 from time import perf_counter
 from typing import Any
 
+from access_control import Principal
 from generation import BaseLLM
 
 from .KnowledgeRetriever import KnowledgeRetriever
@@ -57,6 +58,7 @@ class RagQueryService:
         filters: Mapping[str, Any] | None = None,
         include_sources: bool = True,
         retrieval_mode: str | None = None,
+        principal: Principal | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[RagStreamEvent]:
@@ -99,6 +101,7 @@ class RagQueryService:
             score_threshold=resolved_score_threshold,
             filters=filters,
             retrieval_mode=retrieval_mode,
+            principal=principal,
         )
         if include_sources:
             yield RagStreamEvent(

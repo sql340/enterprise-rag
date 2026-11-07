@@ -50,6 +50,16 @@ class BaseVectorStore(ABC):
     ) -> list[VectorSearchResult]:
         """执行向量相似度检索。"""
 
+    def merge_filters(self, *filters: Any) -> Any:
+        """把访问控制条件和调用方过滤条件合并为 AND 关系。"""
+
+        values = [value for value in filters if value is not None]
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return tuple(values)
+
     @property
     def supports_text_search(self) -> bool:
         """是否支持基于 payload 文本索引的 BM25 检索。"""
@@ -87,6 +97,15 @@ class BaseVectorStore(ABC):
         """删除同步范围内不在预期 chunk_id 集合中的旧块。"""
 
         raise NotImplementedError("当前向量库不支持清理过期知识块")
+
+    def update_payload_by_document(
+        self,
+        document_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """原地更新文档下全部知识块的 payload，不重新计算向量。"""
+
+        raise NotImplementedError("当前向量库不支持原地更新文档 payload")
 
     @abstractmethod
     def delete_by_document(self, document_id: str) -> None:

@@ -73,7 +73,8 @@
 
 ### 存储设计
 
-文档 ACL 存在关系库，写入时把可过滤字段冗余到 Qdrant payload：
+目标态下文档 ACL 存在关系库，写入时把可过滤字段冗余到 Qdrant payload。当前
+第一版由入库代码传入 `DocumentAcl`，关系库和管理接口待后续补齐：
 
 | payload 字段 | 用途 |
 | --- | --- |
@@ -96,6 +97,21 @@
 - 检索、sources 事件、Prompt 拼接三个位置都必须使用同一份已授权结果。
 - 对无权限结果不返回内容、不返回标题，也不向 LLM 发送。
 
+### 当前实现
+
+- `access_control` 模块提供 `Classification`、`Principal`、`DocumentAcl`、
+  `PrincipalResolver` 和 `QdrantAclFilter`。
+- `DocumentAcl.allows()` 与 Qdrant Filter 使用同一套语义：租户、密级、
+  active 状态是硬条件；非管理员还需要 owner、显式用户、角色、用户组或 public
+  密级中的一项。
+- `KnowledgeIndexer` 把文档 ACL 写入每个知识块 payload；ACL 变更可通过
+  `update_acl_by_document()` 原地更新，不重算向量。
+- `RAG_ACL_ENABLED=true` 时，查询接口从可信身份头解析 `Principal`。未配置
+  `RAG_ACL_PROXY_TOKEN` 时查询返回 503，避免信任客户端伪造的身份头。
+- 请求 body 中的 ACL 字段会被拒绝；客户端普通过滤条件与服务端 ACL 以 AND
+  关系合并。
+- ACL 启用前入库且没有 ACL payload 的旧知识块默认不可见，需要迁移后重建。
+
 ### API 与审计
 
 - 网关注入签名身份头或 JWT，服务端校验后生成 `Principal`。
@@ -105,9 +121,9 @@
 
 ### 推荐的落地顺序
 
-1. 先做单租户 + 密级 + 角色/用户组白名单。
-2. 再做多租户硬隔离和 ACL 变更同步。
-3. 最后接企业 SSO/OIDC 与目录服务同步用户组。
+1. 单租户 + 密级 + 角色/用户组白名单：已完成。
+2. 多租户硬隔离和 ACL 变更同步：已完成检索与 payload 更新的第一版。
+3. 企业 SSO/OIDC、ACL 关系库、管理 API 和审计日志：后续实现。
 
 ## 3. 知识入库前端
 
@@ -155,9 +171,12 @@ Browser
 - 页面使用 FastAPI 静态 HTML + 原生 JS，避免为了控制台引入新的前端框架。
 - 所有写操作都必须校验 `knowledge_admin`，普通查询用户不能访问管理接口。
 
-## 4. 本轮先落地的两个完善项
+## 4. 当前完成情况
 
 1. 增量索引：未变化块跳过、配置变化局部重建、旧块安全清理。
 2. 多路检索：dense + Qdrant BM25 文本检索，通过 RRF 融合排序。
+3. 知识权限：租户、密级、owner、用户、角色、用户组和文档状态过滤已接入
+   在线检索链路。
 
-权限模型和入库页面按本文设计分阶段实现，避免在权限还未落地时先做一个可绕过 ACL 的上传页面。
+仍待实现：ACL 关系库、知识管理写接口、审计日志和入库控制台。入库页面必须在
+管理接口完成 `knowledge_admin` 校验之后再落地，避免形成绕过 ACL 的写入入口。

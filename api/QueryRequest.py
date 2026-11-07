@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from access_control import ACL_PAYLOAD_FIELDS
+
 
 class QueryRequest(BaseModel):
     """在线查询请求。"""
@@ -35,6 +37,19 @@ class QueryRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("question 不能为空")
+        return value
+
+    @field_validator("filters")
+    @classmethod
+    def _reject_acl_filters(cls, value: dict[str, Any] | None):
+        if not value:
+            return value
+        reserved = sorted(set(value) & set(ACL_PAYLOAD_FIELDS))
+        if reserved:
+            raise ValueError(
+                "filters 不能包含权限字段，权限由服务端认证上下文决定: "
+                + ", ".join(reserved)
+            )
         return value
 
 

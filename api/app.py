@@ -6,6 +6,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from access_control import PrincipalResolver
 from configs import RagSettings
 from data_processing.knowledge_indexing import (
     BaseEmbedding,
@@ -52,6 +53,7 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
             rrf_k=settings.rag_rrf_k,
             dense_weight=settings.rag_dense_weight,
             keyword_weight=settings.rag_keyword_weight,
+            acl_enabled=settings.rag_acl_enabled,
         ),
         llm,
         PromptBuilder(max_context_chars=settings.rag_max_context_chars),
@@ -108,6 +110,10 @@ def create_app(
         title=resolved_settings.api_title,
         version="0.1.0",
         lifespan=lifespan,
+    )
+    app.state.settings = resolved_settings
+    app.state.principal_resolver = PrincipalResolver(
+        proxy_token=resolved_settings.rag_acl_proxy_token
     )
     if resolved_settings.cors_origins:
         allow_all = resolved_settings.cors_origins == ("*",)

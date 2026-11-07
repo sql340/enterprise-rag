@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
+from access_control import DocumentAcl
 from data_processing.chunker import Chunk, Chunker, DocumentLike
 from retrieval.vector_store import BaseVectorStore
 
@@ -26,6 +28,7 @@ class KnowledgeIndexer:
         delete_stale: 是否删除同步范围内本次未写入的旧块。
         skip_existing: 是否跳过同一模型中 chunk_id 与 content_hash 均未变化
             的知识块，避免重复 Embedding。
+        acl: 默认文档权限；写入时合并进每个知识块的 payload。
     """
 
     def __init__(
@@ -36,12 +39,16 @@ class KnowledgeIndexer:
         sync_scope: str = "source",
         delete_stale: bool = True,
         skip_existing: bool = True,
+        acl: DocumentAcl | None = None,
     ) -> None:
+        if acl is not None and not isinstance(acl, DocumentAcl):
+            raise TypeError("acl 必须是 DocumentAcl 或 None")
         self.embedding = embedding
         self.vector_store = vector_store
         self.sync_scope = self._normalise_scope(sync_scope)
         self.delete_stale = delete_stale
         self.skip_existing = skip_existing
+        self.acl = acl
 
     def index_chunks(
         self,
@@ -50,14 +57,24 @@ class KnowledgeIndexer:
         sync_scope: str | None = None,
         delete_stale: bool | None = None,
         force_reindex: bool | None = None,
+        acl: DocumentAcl | None = None,
     ) -> IndexingResult:
         """向量化并幂等写入知识块。"""
 
         if not chunks:
             raise ValueError("chunks 不能为空")
+        active_acl = acl or self.acl
+        if active_acl is not None and not isinstance(active_acl, DocumentAcl):
+            raise TypeError("acl 必须是 DocumentAcl 或 None")
         values = [chunk for chunk in chunks if chunk.content.strip()]
         if not values:
             raise ValueError("chunks 中没有可向量化的文本")
+        if active_acl is not None:
+            acl_payload = active_acl.to_payload()
+            values = [
+                replace(chunk, metadata={**chunk.metadata, **acl_payload})
+                for chunk in values
+            ]
 
         scope = self._normalise_scope(sync_scope or self.sync_scope)
         should_delete_stale = (
@@ -140,6 +157,20 @@ class KnowledgeIndexer:
 
         return self.index_chunks(chunker.split(documents), **options)
 
+    def update_acl_by_document(
+        self,
+        document_id: str,
+        acl: DocumentAcl,
+    ) -> None:
+        """原地更新一个文档的 ACL，不重新计算向量。"""
+
+        if not isinstance(acl, DocumentAcl):
+            raise TypeError("acl 必须是 DocumentAcl")
+        self.vector_store.update_payload_by_document(
+            document_id,
+            acl.to_payload(),
+        )
+
     @property
     def _collection_name(self) -> str:
         return str(getattr(self.vector_store, "collection_name", ""))
@@ -154,6 +185,8 @@ class KnowledgeIndexer:
         return (
             str(existing.get("embedding_model") or "") == self.embedding.model_name
             and str(existing.get("content_hash") or "") == chunk.content_hash
+            and DocumentAcl.payload_signature(existing)
+            == DocumentAcl.payload_signature(chunk.metadata)
         )
 
     @staticmethod
