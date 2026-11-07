@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from access_control import AccessControlError, Principal, QdrantAclFilter
 from data_processing.knowledge_indexing import BaseEmbedding
 
 from .RrfFusion import RrfFusion
@@ -27,6 +28,7 @@ class KnowledgeRetriever:
         rrf_k: int = 60,
         dense_weight: float = 1.0,
         keyword_weight: float = 0.8,
+        acl_enabled: bool = False,
     ) -> None:
         if candidate_multiplier <= 0:
             raise ValueError("candidate_multiplier 必须为正整数")
@@ -43,6 +45,7 @@ class KnowledgeRetriever:
         self.rrf_fusion = RrfFusion(k=rrf_k)
         self.dense_weight = dense_weight
         self.keyword_weight = keyword_weight
+        self.acl_enabled = acl_enabled
 
     def retrieve(
         self,
@@ -50,8 +53,9 @@ class KnowledgeRetriever:
         *,
         top_k: int = 5,
         score_threshold: float | None = None,
-        filters: Mapping[str, Any] | None = None,
+        filters: Mapping[str, Any] | Any | None = None,
         retrieval_mode: str | None = None,
+        principal: Principal | None = None,
     ) -> list[VectorSearchResult]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question 不能为空")
@@ -63,13 +67,14 @@ class KnowledgeRetriever:
             if retrieval_mode is None
             else _normalise_mode(retrieval_mode)
         )
+        effective_filters = self._effective_filters(filters, principal)
         query_vector = self.embedding.embed_query(question.strip())
         if mode == "dense":
             return self._dense_search(
                 query_vector,
                 limit=top_k,
                 score_threshold=score_threshold,
-                filters=filters,
+                filters=effective_filters,
                 retrieval_mode="dense",
             )
 
@@ -81,7 +86,7 @@ class KnowledgeRetriever:
             query_vector,
             limit=candidate_limit,
             score_threshold=score_threshold,
-            filters=filters,
+            filters=effective_filters,
             retrieval_mode="dense",
         )
         if not self.vector_store.supports_text_search:
@@ -91,7 +96,7 @@ class KnowledgeRetriever:
             keyword_results = self.vector_store.text_search(
                 question,
                 limit=candidate_limit,
-                filters=filters,
+                filters=effective_filters,
             )
         except (NotImplementedError, RuntimeError) as exc:
             logger.warning("BM25 文本检索不可用，回退到 dense 检索: %s", exc)
@@ -109,7 +114,7 @@ class KnowledgeRetriever:
         *,
         limit: int,
         score_threshold: float | None,
-        filters: Mapping[str, Any] | None,
+        filters: Mapping[str, Any] | Any | None,
         retrieval_mode: str,
     ) -> list[VectorSearchResult]:
         results = self.vector_store.search(
@@ -123,6 +128,26 @@ class KnowledgeRetriever:
             result.route_scores.setdefault("dense", result.score)
             result.route_ranks.setdefault("dense", rank)
         return results
+
+    def _effective_filters(
+        self,
+        filters: Mapping[str, Any] | Any | None,
+        principal: Principal | None,
+    ) -> Any:
+        access_filter = None
+        if self.acl_enabled:
+            if principal is None:
+                raise AccessControlError("ACL 已启用，但请求缺少认证主体")
+            access_filter = QdrantAclFilter(principal).build()
+        values = [value for value in (access_filter, filters) if value is not None]
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        merge_filters = getattr(self.vector_store, "merge_filters", None)
+        if merge_filters is None:
+            return tuple(values)
+        return merge_filters(*values)
 
 
 def _normalise_mode(mode: str) -> str:

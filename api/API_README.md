@@ -35,6 +35,10 @@ EMBEDDING_MODEL=BAAI/bge-m3
 LLM_BASE_URL=http://localhost:8000/v1
 LLM_MODEL=gpt-4o-mini
 LLM_API_KEY=
+
+# 启用 ACL 时必填；由可信网关注入同一个共享密钥
+RAG_ACL_ENABLED=true
+RAG_ACL_PROXY_TOKEN=replace-with-a-strong-random-secret
 ```
 
 Embedding 和 LLM 都支持 OpenAI 兼容服务。如果 Embedding 使用企业网关，
@@ -46,6 +50,12 @@ Embedding 和 LLM 都支持 OpenAI 兼容服务。如果 Embedding 使用企业�
 ```bash
 curl -N -X POST http://localhost:8080/v1/query \
   -H 'Content-Type: application/json' \
+  -H "X-Rag-Proxy-Token: $RAG_ACL_PROXY_TOKEN" \
+  -H 'X-Tenant-Id: tenant-a' \
+  -H 'X-User-Id: user-1' \
+  -H 'X-User-Roles: finance,viewer' \
+  -H 'X-User-Groups: audit' \
+  -H 'X-User-Clearance: internal' \
   -d '{
     "question": "报销需要准备哪些材料？",
     "top_k": 5,
@@ -103,22 +113,72 @@ data: {"finish_reason":"stop","elapsed_ms":1832.4}
 `chunk_role` 和 `embedding_model`。父子分块场景通常过滤
 `chunk_role=child`。
 
+`filters` 不允许包含 `tenant_id`、`classification`、`allowed_roles`、
+`allowed_groups`、`allowed_users`、`owner_id`、`document_status` 或
+`acl_version`；这些字段只能由服务端认证上下文生成，否则请求返回 422。
+
 默认使用 `hybrid`：dense 向量召回和 Qdrant BM25 文本召回各取候选，再通过
 RRF 融合。融合结果的 `score` 是 RRF 排名分，不是余弦相似度；`sources`
 事件会同时返回 `retrieval_mode`、`route_scores` 以及每路原始分数。文本索引
 不可用或旧 collection 尚未重建时，会自动回退到 dense 检索。
 
+## 身份与知识权限
+
+`RAG_ACL_ENABLED=true` 时，查询接口要求以下可信身份头：
+
+| 请求头 | 说明 |
+| --- | --- |
+| `X-Rag-Proxy-Token` | 网关与 RAG 服务共享的密钥 |
+| `X-Tenant-Id` | 租户 ID，必须与知识块 `tenant_id` 完全一致 |
+| `X-User-Id` | 用户 ID，大小写敏感 |
+| `X-User-Roles` | 逗号分隔的角色，服务端统一转小写 |
+| `X-User-Groups` | 逗号分隔的用户组，服务端统一转小写 |
+| `X-User-Clearance` | `public`、`internal`、`confidential` 或 `secret` |
+| `X-User-Name` | 可选展示名 |
+
+身份头只有在可信网关已经完成认证、剥离客户端伪造值并重新注入时才可信任。
+直接暴露 API 端口会破坏这一前提。`RAG_ACL_PROXY_TOKEN` 未配置时，ACL 查询会
+返回 503，服务不会退回到“信任任意请求头”的模式。
+
+仅在本地调试或迁移旧系统时可以设置 `RAG_ACL_ENABLED=false` 临时关闭 ACL；
+生产环境不应关闭。
+
+文档和知识块的权限关系为：
+
+1. `tenant_id` 必须完全一致。
+2. 用户 `clearance` 必须大于等于文档 `classification`。
+3. 文档状态必须为 `active`。
+4. 非管理员还必须满足 owner、用户白名单、角色白名单、用户组白名单或
+   `public` 密级中的至少一项。
+
+`knowledge_admin` 和 `platform_admin` 可以跳过第 4 条，但仍不能跨租户、越密级
+读取或读取已归档/删除文档。知识块继承文档 ACL；ACL 变更后可通过
+`KnowledgeIndexer.update_acl_by_document()` 原地更新 payload，不必重算向量。
+
+ACL 启用前已经入库、没有 `tenant_id` 和 ACL payload 的旧知识块默认不可见。
+需要为这些文档补齐 ACL 并重新入库，不能依赖兼容模式放宽过滤。
+
 ## Python 客户端
 
 ```python
 import json
+import os
 
 import httpx
 
 
+headers = {
+    "X-Rag-Proxy-Token": os.environ["RAG_ACL_PROXY_TOKEN"],
+    "X-Tenant-Id": "tenant-a",
+    "X-User-Id": "user-1",
+    "X-User-Roles": "finance,viewer",
+    "X-User-Groups": "audit",
+    "X-User-Clearance": "internal",
+}
 with httpx.stream(
     "POST",
     "http://localhost:8080/v1/query",
+    headers=headers,
     json={"question": "差旅报销标准是什么？", "top_k": 5},
     timeout=120,
 ) as response:
@@ -145,6 +205,12 @@ api/
 └── routes/
     ├── health.py             # 健康检查
     └── query.py              # 流式查询路由
+access_control/
+├── Classification.py         # 文档密级
+├── Principal.py              # 已认证主体
+├── PrincipalResolver.py      # 可信身份头解析
+├── DocumentAcl.py            # 文档 ACL 与访问策略
+└── QdrantAclFilter.py        # Qdrant 强制访问过滤条件
 generation/
 ├── BaseLLM.py                # 流式 LLM 接口
 ├── OpenAICompatibleLLM.py    # OpenAI 兼容 Chat Completions
@@ -158,7 +224,9 @@ retrieval/
 
 ## 生产注意事项
 
-- API 本身未内置鉴权，建议放在企业网关或反向代理后，并启用 TLS。
+- API 依赖企业网关完成认证并注入可信身份头；必须配置 ACL 代理令牌并启用 TLS。
+- 网关必须删除客户端传入的 `X-Tenant-Id`、`X-User-Id`、`X-User-Roles`、
+  `X-User-Groups`、`X-User-Clearance` 和 `X-Rag-Proxy-Token`，再写入认证结果。
 - 使用本地 bge-m3 和 GPU 时，每个 uvicorn worker 都会加载一份模型；按显存
   控制 worker 数量。Embedding 也可切换到独立的企业 OpenAI 兼容服务。
 - SentenceTransformer 首次查询会加载模型；生产环境建议预热模型缓存。
