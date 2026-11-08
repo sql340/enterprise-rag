@@ -177,6 +177,8 @@ Browser
 2. 多路检索：dense + Qdrant BM25 文本检索，通过 RRF 融合排序。
 3. 知识权限：租户、密级、owner、用户、角色、用户组和文档状态过滤已接入
    在线检索链路。
+4. Graph RAG：实体关系图谱作为第三路召回，与 dense/BM25 通过 RRF 融合；图谱
+   只返回 chunk_id，正文仍从 Qdrant 按 ACL 读取。
 
 仍待实现：ACL 关系库、知识管理写接口、审计日志和入库控制台。入库页面必须在
 管理接口完成 `knowledge_admin` 校验之后再落地，避免形成绕过 ACL 的写入入口。

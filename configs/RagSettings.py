@@ -105,12 +105,17 @@ class RagSettings:
     rag_top_k: int = 5
     rag_score_threshold: float | None = None
     rag_max_context_chars: int = 12000
-    rag_retrieval_mode: str = "hybrid"
+    rag_retrieval_mode: str = "hybrid_graph"
     rag_candidate_multiplier: int = 4
     rag_max_candidates: int = 100
     rag_rrf_k: int = 60
     rag_dense_weight: float = 1.0
     rag_keyword_weight: float = 0.8
+    rag_graph_enabled: bool = True
+    rag_graph_store_path: str = ".cache/knowledge_graph.sqlite3"
+    rag_graph_weight: float = 0.8
+    rag_graph_max_hops: int = 1
+    rag_graph_entity_limit: int = 20
     rag_acl_enabled: bool = True
     rag_acl_proxy_token: str | None = None
 
@@ -156,18 +161,46 @@ class RagSettings:
         retrieval_mode = (
             self.rag_retrieval_mode.strip().lower().replace("-", "_")
         )
-        if retrieval_mode not in {"dense", "hybrid", "multi_route"}:
-            raise ValueError("RAG_RETRIEVAL_MODE 必须是 dense 或 hybrid")
+        if retrieval_mode not in {
+            "dense",
+            "hybrid",
+            "graph",
+            "hybrid_graph",
+            "multi_route",
+        }:
+            raise ValueError(
+                "RAG_RETRIEVAL_MODE 必须是 dense、hybrid、graph 或 hybrid_graph"
+            )
         if self.rag_candidate_multiplier <= 0:
             raise ValueError("RAG_CANDIDATE_MULTIPLIER 必须为正整数")
         if self.rag_max_candidates <= 0:
             raise ValueError("RAG_MAX_CANDIDATES 必须为正整数")
         if self.rag_rrf_k <= 0:
             raise ValueError("RAG_RRF_K 必须为正整数")
-        if self.rag_dense_weight < 0 or self.rag_keyword_weight < 0:
+        if (
+            self.rag_dense_weight < 0
+            or self.rag_keyword_weight < 0
+            or self.rag_graph_weight < 0
+        ):
             raise ValueError("检索路权重不能为负数")
-        if self.rag_dense_weight == 0 and self.rag_keyword_weight == 0:
-            raise ValueError("dense 和 keyword 权重不能同时为 0")
+        if retrieval_mode == "hybrid" and (
+            self.rag_dense_weight == 0 and self.rag_keyword_weight == 0
+        ):
+            raise ValueError("hybrid 模式下 dense 和 keyword 权重不能同时为 0")
+        if retrieval_mode == "hybrid_graph" and (
+            self.rag_dense_weight == 0
+            and self.rag_keyword_weight == 0
+            and self.rag_graph_weight == 0
+        ):
+            raise ValueError("hybrid_graph 模式下三路检索权重不能同时为 0")
+        if retrieval_mode == "graph" and not self.rag_graph_enabled:
+            raise ValueError("graph 检索模式要求 RAG_GRAPH_ENABLED=true")
+        if self.rag_graph_enabled and not self.rag_graph_store_path.strip():
+            raise ValueError("RAG_GRAPH_STORE_PATH 不能为空")
+        if not 1 <= self.rag_graph_max_hops <= 3:
+            raise ValueError("RAG_GRAPH_MAX_HOPS 必须在 1 到 3 之间")
+        if self.rag_graph_entity_limit <= 0:
+            raise ValueError("RAG_GRAPH_ENTITY_LIMIT 必须为正整数")
 
     @classmethod
     def from_env(cls) -> "RagSettings":
@@ -202,12 +235,19 @@ class RagSettings:
             rag_top_k=_env_int("RAG_TOP_K", 5),
             rag_score_threshold=_env_optional_float("RAG_SCORE_THRESHOLD"),
             rag_max_context_chars=_env_int("RAG_MAX_CONTEXT_CHARS", 12000),
-            rag_retrieval_mode=_env("RAG_RETRIEVAL_MODE", "hybrid"),
+            rag_retrieval_mode=_env("RAG_RETRIEVAL_MODE", "hybrid_graph"),
             rag_candidate_multiplier=_env_int("RAG_CANDIDATE_MULTIPLIER", 4),
             rag_max_candidates=_env_int("RAG_MAX_CANDIDATES", 100),
             rag_rrf_k=_env_int("RAG_RRF_K", 60),
             rag_dense_weight=_env_float("RAG_DENSE_WEIGHT", 1.0),
             rag_keyword_weight=_env_float("RAG_KEYWORD_WEIGHT", 0.8),
+            rag_graph_enabled=_env_bool("RAG_GRAPH_ENABLED", True),
+            rag_graph_store_path=_env(
+                "RAG_GRAPH_STORE_PATH", ".cache/knowledge_graph.sqlite3"
+            ),
+            rag_graph_weight=_env_float("RAG_GRAPH_WEIGHT", 0.8),
+            rag_graph_max_hops=_env_int("RAG_GRAPH_MAX_HOPS", 1),
+            rag_graph_entity_limit=_env_int("RAG_GRAPH_ENTITY_LIMIT", 20),
             rag_acl_enabled=_env_bool("RAG_ACL_ENABLED", True),
             rag_acl_proxy_token=_env_optional("RAG_ACL_PROXY_TOKEN"),
             api_title=_env("API_TITLE", "Enterprise RAG API"),

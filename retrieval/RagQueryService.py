@@ -146,7 +146,11 @@ class RagQueryService:
         try:
             await self.llm.aclose()
         finally:
-            self.retriever.vector_store.close()
+            close = getattr(self.retriever, "close", None)
+            if close is not None:
+                close()
+            else:
+                self.retriever.vector_store.close()
 
     @staticmethod
     def _source_payload(source: VectorSearchResult, index: int) -> dict[str, Any]:

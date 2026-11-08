@@ -1,8 +1,8 @@
 # enterprise-rag
 企业级RAG落地
 
-当前已包含数据读取、文本分块、Embedding、Qdrant 向量入库、多租户知识权限，
-以及基于 FastAPI + SSE 的在线流式问答能力。
+当前已包含数据读取、文本分块、Embedding、Qdrant 向量入库、多租户知识权限、
+Graph RAG 实体关系召回，以及基于 FastAPI + SSE 的在线流式问答能力。
 
 ## 快速开始
 
@@ -35,6 +35,9 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 知识质量、权限分级和入库控制台的设计方案见
 [`docs/KNOWLEDGE_GOVERNANCE.md`](docs/KNOWLEDGE_GOVERNANCE.md)。
 
+Graph RAG 的构建、检索模式和 ACL 安全边界见
+[`docs/GRAPH_RAG.md`](docs/GRAPH_RAG.md)。
+
 ## 知识权限
 
 权限模型采用默认拒绝的 RBAC + ABAC：租户必须一致，用户密级必须覆盖文档密级，
@@ -45,3 +48,12 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 `X-User-Groups`、`X-User-Clearance` 请求头解析身份。启用 ACL 时必须配置
 `RAG_ACL_PROXY_TOKEN`，网关必须覆盖而不是透传外部传入的同名身份头。具体接入
 方式见 [`api/API_README.md`](api/API_README.md)。
+
+## Graph RAG
+
+默认检索模式为 `hybrid_graph`：dense 向量、Qdrant BM25 和图谱实体召回三路
+并行，通过 RRF 融合。图谱检索只返回候选 `chunk_id`，随后仍从 Qdrant 按当前
+用户 ACL 读取正文，因此不会绕过知识权限。
+
+图数据需要与向量索引一起构建；未构建图谱时，graph 路为空，系统自动退化为
+dense + BM25 的原始 RAG 行为。

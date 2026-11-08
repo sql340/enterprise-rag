@@ -381,6 +381,67 @@ indexer.update_acl_by_document(
 这个操作只更新 payload，不重新计算向量。ACL 启用前入库、没有 ACL payload 的
 旧知识块默认不可见，需要补齐权限后重新入库。
 
+### Graph RAG 图谱构建
+
+Graph RAG 复用同一批 `Chunk`，在向量入库之后额外构建实体关系图谱。两套索引
+共享 `chunk_id`，在线检索时图谱只负责召回候选 ID，正文仍从 Qdrant 按当前用户
+ACL 读取，因此不会形成绕过权限的第二套知识库。
+
+```python
+from graph_rag import (
+    GraphIndexer,
+    OpenAICompatibleGraphExtractor,
+    SqliteGraphStore,
+)
+
+# vector_result 来自上文的 KnowledgeIndexer.index_chunks(chunks, acl=acl)
+graph_store = SqliteGraphStore(".cache/knowledge_graph.sqlite3")
+extractor = OpenAICompatibleGraphExtractor(
+    "gpt-4o-mini",
+    base_url="http://localhost:8000/v1",
+    api_key="YOUR_API_KEY",
+)
+graph_indexer = GraphIndexer(graph_store, extractor)
+graph_result = graph_indexer.index_chunks(chunks, acl=acl)
+print(graph_result.indexed_chunks, graph_result.skipped_chunks)
+print(graph_result.failures)
+```
+
+未变化的知识块会按 `content_hash + extractor_version` 跳过，避免重复调用抽取
+模型。文件内容或分块配置变化后，应清理该文档下已经消失的旧块；文档删除时同步
+删除图谱：
+
+```python
+graph_indexer.prune_stale_chunks(
+    tenant_id="tenant-a",
+    document_id=document_id,
+    expected_chunk_ids=[chunk.chunk_id for chunk in chunks],
+)
+graph_indexer.delete_by_document(
+    tenant_id="tenant-a",
+    document_id=document_id,
+)
+```
+
+图谱模块按类拆分，便于替换存储或抽取器：
+
+```text
+graph_rag/
+├── BaseGraphExtractor.py              # 实体关系抽取接口
+├── BaseGraphStore.py                  # 图谱存储接口
+├── GraphIndexer.py                    # 增量构建与删除
+├── GraphRetriever.py                  # 按实体和邻居召回 chunk_id
+├── SqliteGraphStore.py                # 单机 SQLite 实现
+├── OpenAICompatibleGraphExtractor.py  # OpenAI 兼容 LLM 抽取
+├── GraphEntity.py / GraphRelation.py  # 实体与关系模型
+├── GraphExtraction.py                 # 单块抽取结果
+├── GraphSearchHit.py                  # 图谱召回结果
+├── GraphIndexingResult.py             # 构建结果摘要
+└── GraphExtractionError.py            # 抽取异常
+```
+
+完整的在线融合、ACL 安全边界和配置说明见 `docs/GRAPH_RAG.md`。
+
 ### 检索示例
 
 ```python

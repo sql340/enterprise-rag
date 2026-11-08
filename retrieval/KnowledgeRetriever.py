@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from access_control import AccessControlError, Principal, QdrantAclFilter
 from data_processing.knowledge_indexing import BaseEmbedding
+from graph_rag import GraphRetriever, GraphSearchHit
 
 from .RrfFusion import RrfFusion
 from .vector_store import BaseVectorStore, VectorSearchResult
@@ -28,13 +29,15 @@ class KnowledgeRetriever:
         rrf_k: int = 60,
         dense_weight: float = 1.0,
         keyword_weight: float = 0.8,
+        graph_retriever: GraphRetriever | None = None,
+        graph_weight: float = 0.8,
         acl_enabled: bool = False,
     ) -> None:
         if candidate_multiplier <= 0:
             raise ValueError("candidate_multiplier 必须为正整数")
         if max_candidates <= 0:
             raise ValueError("max_candidates 必须为正整数")
-        if dense_weight < 0 or keyword_weight < 0:
+        if dense_weight < 0 or keyword_weight < 0 or graph_weight < 0:
             raise ValueError("检索路权重不能为负数")
 
         self.embedding = embedding
@@ -45,6 +48,8 @@ class KnowledgeRetriever:
         self.rrf_fusion = RrfFusion(k=rrf_k)
         self.dense_weight = dense_weight
         self.keyword_weight = keyword_weight
+        self.graph_retriever = graph_retriever
+        self.graph_weight = graph_weight
         self.acl_enabled = acl_enabled
 
     def retrieve(
@@ -68,6 +73,14 @@ class KnowledgeRetriever:
             else _normalise_mode(retrieval_mode)
         )
         effective_filters = self._effective_filters(filters, principal)
+        if mode == "graph":
+            return self._graph_search(
+                question,
+                filters=effective_filters,
+                principal=principal,
+                limit=top_k,
+            )
+
         query_vector = self.embedding.embed_query(question.strip())
         if mode == "dense":
             return self._dense_search(
@@ -89,23 +102,39 @@ class KnowledgeRetriever:
             filters=effective_filters,
             retrieval_mode="dense",
         )
-        if not self.vector_store.supports_text_search:
-            return dense_results[:top_k]
+        routes = {"dense": dense_results}
 
-        try:
-            keyword_results = self.vector_store.text_search(
+        if self.vector_store.supports_text_search:
+            try:
+                routes["keyword"] = self.vector_store.text_search(
+                    question,
+                    limit=candidate_limit,
+                    filters=effective_filters,
+                )
+            except (NotImplementedError, RuntimeError) as exc:
+                logger.warning("BM25 文本检索不可用，继续使用其它检索路: %s", exc)
+
+        if mode == "hybrid_graph":
+            graph_results = self._graph_search(
                 question,
-                limit=candidate_limit,
                 filters=effective_filters,
+                principal=principal,
+                limit=candidate_limit,
             )
-        except (NotImplementedError, RuntimeError) as exc:
-            logger.warning("BM25 文本检索不可用，回退到 dense 检索: %s", exc)
+            if graph_results:
+                routes["graph"] = graph_results
+
+        if len(routes) == 1:
             return dense_results[:top_k]
 
         return self.rrf_fusion.fuse(
-            {"dense": dense_results, "keyword": keyword_results},
+            routes,
             limit=top_k,
-            weights={"dense": self.dense_weight, "keyword": self.keyword_weight},
+            weights={
+                "dense": self.dense_weight,
+                "keyword": self.keyword_weight,
+                "graph": self.graph_weight,
+            },
         )
 
     def _dense_search(
@@ -129,6 +158,84 @@ class KnowledgeRetriever:
             result.route_ranks.setdefault("dense", rank)
         return results
 
+    def _graph_search(
+        self,
+        question: str,
+        *,
+        filters: Mapping[str, Any] | Any | None,
+        principal: Principal | None,
+        limit: int,
+    ) -> list[VectorSearchResult]:
+        if self.graph_retriever is None or principal is None:
+            return []
+
+        ceiling = max(limit, self.max_candidates)
+        fetch_limit = min(
+            ceiling,
+            max(limit, limit * self.candidate_multiplier),
+        )
+        while True:
+            try:
+                hits = self.graph_retriever.retrieve(
+                    question,
+                    tenant_id=principal.tenant_id,
+                    limit=fetch_limit,
+                )
+            except Exception as exc:
+                logger.warning("图谱检索不可用，跳过 graph 路: %s", exc)
+                return []
+            if not hits:
+                return []
+
+            results = self._hydrate_graph_hits(hits, filters=filters)
+            if (
+                len(results) >= limit
+                or fetch_limit >= ceiling
+                or len(hits) < fetch_limit
+            ):
+                return results[:limit]
+
+            next_limit = min(
+                ceiling,
+                max(
+                    fetch_limit + limit,
+                    fetch_limit * self.candidate_multiplier,
+                ),
+            )
+            if next_limit <= fetch_limit:
+                return results[:limit]
+            fetch_limit = next_limit
+
+    def _hydrate_graph_hits(
+        self,
+        hits: Sequence[GraphSearchHit],
+        *,
+        filters: Mapping[str, Any] | Any | None,
+    ) -> list[VectorSearchResult]:
+        chunk_ids = list(dict.fromkeys(hit.chunk_id for hit in hits))
+        try:
+            chunks = self.vector_store.get_chunks_by_ids(
+                chunk_ids,
+                filters=filters,
+            )
+        except Exception as exc:
+            logger.warning("图谱候选正文读取失败，跳过 graph 路: %s", exc)
+            return []
+        chunks_by_id = {result.chunk_id: result for result in chunks}
+
+        results: list[VectorSearchResult] = []
+        for hit in hits:
+            result = chunks_by_id.get(hit.chunk_id)
+            if result is None:
+                continue
+            result.score = hit.score
+            result.retrieval_mode = "graph"
+            result.route_scores["graph"] = hit.score
+            results.append(result)
+        for rank, result in enumerate(results, start=1):
+            result.route_ranks["graph"] = rank
+        return results
+
     def _effective_filters(
         self,
         filters: Mapping[str, Any] | Any | None,
@@ -149,6 +256,13 @@ class KnowledgeRetriever:
             return tuple(values)
         return merge_filters(*values)
 
+    def close(self) -> None:
+        try:
+            self.vector_store.close()
+        finally:
+            if self.graph_retriever is not None:
+                self.graph_retriever.close()
+
 
 def _normalise_mode(mode: str) -> str:
     value = str(mode).strip().lower().replace("-", "_")
@@ -156,7 +270,11 @@ def _normalise_mode(mode: str) -> str:
         return "dense"
     if value in {"hybrid", "hybrid_rrf", "multi_route"}:
         return "hybrid"
-    raise ValueError("retrieval_mode 必须是 dense 或 hybrid")
+    if value in {"graph", "graph_only"}:
+        return "graph"
+    if value in {"hybrid_graph", "graph_hybrid"}:
+        return "hybrid_graph"
+    raise ValueError("retrieval_mode 必须是 dense、hybrid、graph 或 hybrid_graph")
 
 
 __all__ = ["KnowledgeRetriever"]
