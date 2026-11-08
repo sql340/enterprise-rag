@@ -39,6 +39,13 @@ LLM_API_KEY=
 # 启用 ACL 时必填；由可信网关注入同一个共享密钥
 RAG_ACL_ENABLED=true
 RAG_ACL_PROXY_TOKEN=replace-with-a-strong-random-secret
+
+# Graph RAG：默认参与 RRF 融合；未构建图谱时自动退化为 dense + BM25
+RAG_RETRIEVAL_MODE=hybrid_graph
+RAG_GRAPH_ENABLED=true
+RAG_GRAPH_STORE_PATH=.cache/knowledge_graph.sqlite3
+RAG_GRAPH_WEIGHT=0.8
+RAG_GRAPH_MAX_HOPS=1
 ```
 
 Embedding 和 LLM 都支持 OpenAI 兼容服务。如果 Embedding 使用企业网关，
@@ -105,7 +112,7 @@ data: {"finish_reason":"stop","elapsed_ms":1832.4}
 | `score_threshold` | number | 最低相似度分数，默认取 `RAG_SCORE_THRESHOLD` |
 | `filters` | object | Qdrant payload 过滤条件，值可为标量或数组 |
 | `include_sources` | boolean | 是否发送 `sources` 事件，默认 true |
-| `retrieval_mode` | string | `hybrid` 或 `dense`，默认取 `RAG_RETRIEVAL_MODE` |
+| `retrieval_mode` | string | `dense`、`hybrid`、`graph` 或 `hybrid_graph`，默认取 `RAG_RETRIEVAL_MODE` |
 | `temperature` | number | 覆盖 LLM 温度，范围 0 到 2 |
 | `max_tokens` | integer | 覆盖最大生成 token 数 |
 
@@ -117,10 +124,24 @@ data: {"finish_reason":"stop","elapsed_ms":1832.4}
 `allowed_groups`、`allowed_users`、`owner_id`、`document_status` 或
 `acl_version`；这些字段只能由服务端认证上下文生成，否则请求返回 422。
 
-默认使用 `hybrid`：dense 向量召回和 Qdrant BM25 文本召回各取候选，再通过
-RRF 融合。融合结果的 `score` 是 RRF 排名分，不是余弦相似度；`sources`
-事件会同时返回 `retrieval_mode`、`route_scores` 以及每路原始分数。文本索引
-不可用或旧 collection 尚未重建时，会自动回退到 dense 检索。
+默认使用 `hybrid_graph`：dense 向量召回、Qdrant BM25 文本召回和图谱实体召回
+各取候选，再通过 RRF 融合。融合结果的 `score` 是 RRF 排名分，不是余弦相似度；
+`sources` 事件会同时返回 `retrieval_mode`、`route_scores` 以及每路原始分数。
+文本索引或图谱不可用时，会自动使用其余可用检索路；全部增强路不可用时退化为
+dense 检索。
+
+各模式含义：
+
+| 模式 | 说明 |
+| --- | --- |
+| `dense` | 仅向量相似度召回 |
+| `hybrid` | dense + BM25，通过 RRF 融合 |
+| `graph` | 仅实体关系图谱召回 |
+| `hybrid_graph` | dense + BM25 + graph 三路融合，默认模式 |
+
+Graph RAG 需要先用 `GraphIndexer` 构建实体关系。图谱只返回候选 `chunk_id`，
+服务端随后通过 Qdrant 的 ACL 过滤读取正文；知识图谱路由不会绕过租户和文档权限。
+构建方式见 [`../docs/GRAPH_RAG.md`](../docs/GRAPH_RAG.md)。
 
 ## 身份与知识权限
 
@@ -220,6 +241,11 @@ retrieval/
 ├── PromptBuilder.py          # 引用编号上下文与系统 Prompt
 ├── RagQueryService.py        # 在线 RAG 流式编排
 └── RagStreamEvent.py         # 流式事件
+graph_rag/
+├── GraphIndexer.py           # 实体关系抽取入库
+├── GraphRetriever.py         # 按实体和邻居召回 chunk_id
+├── SqliteGraphStore.py       # 单机图谱存储
+└── OpenAICompatibleGraphExtractor.py # LLM 实体关系抽取
 ```
 
 ## 生产注意事项

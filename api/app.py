@@ -14,6 +14,7 @@ from data_processing.knowledge_indexing import (
     SentenceTransformerEmbedding,
 )
 from generation import OpenAICompatibleLLM
+from graph_rag import GraphRetriever, SqliteGraphStore
 from retrieval import (
     KnowledgeRetriever,
     PromptBuilder,
@@ -43,6 +44,13 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
         api_key=settings.llm_api_key,
         timeout=settings.llm_timeout,
     )
+    graph_retriever = None
+    if settings.rag_graph_enabled:
+        graph_retriever = GraphRetriever(
+            SqliteGraphStore(settings.rag_graph_store_path),
+            max_hops=settings.rag_graph_max_hops,
+            entity_limit=settings.rag_graph_entity_limit,
+        )
     return RagQueryService(
         KnowledgeRetriever(
             embedding,
@@ -53,6 +61,8 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
             rrf_k=settings.rag_rrf_k,
             dense_weight=settings.rag_dense_weight,
             keyword_weight=settings.rag_keyword_weight,
+            graph_retriever=graph_retriever,
+            graph_weight=settings.rag_graph_weight,
             acl_enabled=settings.rag_acl_enabled,
         ),
         llm,

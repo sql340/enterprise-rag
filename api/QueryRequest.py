@@ -27,7 +27,7 @@ class QueryRequest(BaseModel):
     score_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     filters: dict[str, Any] | None = None
     include_sources: bool = True
-    retrieval_mode: Literal["dense", "hybrid"] | None = None
+    retrieval_mode: Literal["dense", "hybrid", "graph", "hybrid_graph"] | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=8192)
 

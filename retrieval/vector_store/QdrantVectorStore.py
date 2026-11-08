@@ -611,6 +611,55 @@ class QdrantVectorStore(BaseVectorStore):
             for point in response.points
         ]
 
+    def get_chunks_by_ids(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        filters: Mapping[str, Any] | Any | None = None,
+    ) -> list[VectorSearchResult]:
+        values = [str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)]
+        if not values:
+            return []
+        if not self.client.collection_exists(self.collection_name):
+            return []
+
+        id_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="chunk_id",
+                    match=models.MatchAny(any=values),
+                )
+            ]
+        )
+        access_filter = self._build_filter(filters)
+        scroll_filter = (
+            models.Filter(must=[access_filter, id_filter])
+            if access_filter is not None
+            else id_filter
+        )
+
+        results: list[VectorSearchResult] = []
+        offset: Any = None
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=scroll_filter,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            results.extend(
+                VectorSearchResult(
+                    id=str(record.id),
+                    score=0.0,
+                    payload=dict(record.payload or {}),
+                )
+                for record in records
+            )
+            if offset is None:
+                return results
+
     def _load_collection_dimension(self) -> int | None:
         info = self.client.get_collection(self.collection_name)
         self._dimension = self._collection_dimension(info)

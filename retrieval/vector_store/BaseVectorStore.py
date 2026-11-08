@@ -77,6 +77,16 @@ class BaseVectorStore(ABC):
 
         raise NotImplementedError("当前向量库不支持 BM25 文本检索")
 
+    def get_chunks_by_ids(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        filters: Any = None,
+    ) -> list[VectorSearchResult]:
+        """按 chunk_id 读取知识块，并继续应用 ACL/调用方过滤条件。"""
+
+        raise NotImplementedError("当前向量库不支持按 chunk_id 批量读取")
+
     def list_chunk_records(
         self,
         *,
