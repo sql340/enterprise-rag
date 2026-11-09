@@ -169,6 +169,9 @@ class RagQueryService:
             "retrieval_mode": source.retrieval_mode,
             "route_scores": source.route_scores,
             "content": source.content,
+            "context_content": source.payload.get("context_content"),
+            "parent_chunk_id": source.payload.get("parent_chunk_id"),
+            "parent_expanded": bool(source.payload.get("parent_expanded")),
         }
 
     @staticmethod

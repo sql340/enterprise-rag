@@ -119,6 +119,16 @@ class RagSettings:
     rag_acl_enabled: bool = True
     rag_acl_proxy_token: str | None = None
 
+    rag_governance_db_path: str = ".cache/knowledge_governance.sqlite3"
+    rag_upload_dir: str = ".cache/knowledge_uploads"
+    rag_admin_max_file_bytes: int = 50 * 1024 * 1024
+
+    rag_rerank_enabled: bool = False
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rag_rerank_device: str | None = None
+    rag_rerank_candidates: int = 30
+    rag_expand_parent_context: bool = True
+
     api_title: str = "Enterprise RAG API"
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
 
@@ -201,6 +211,16 @@ class RagSettings:
             raise ValueError("RAG_GRAPH_MAX_HOPS 必须在 1 到 3 之间")
         if self.rag_graph_entity_limit <= 0:
             raise ValueError("RAG_GRAPH_ENTITY_LIMIT 必须为正整数")
+        if not self.rag_governance_db_path.strip():
+            raise ValueError("RAG_GOVERNANCE_DB_PATH 不能为空")
+        if not self.rag_upload_dir.strip():
+            raise ValueError("RAG_UPLOAD_DIR 不能为空")
+        if self.rag_admin_max_file_bytes <= 0:
+            raise ValueError("RAG_ADMIN_MAX_FILE_BYTES 必须为正整数")
+        if not self.rag_rerank_model.strip():
+            raise ValueError("RAG_RERANK_MODEL 不能为空")
+        if self.rag_rerank_candidates <= 0:
+            raise ValueError("RAG_RERANK_CANDIDATES 必须为正整数")
 
     @classmethod
     def from_env(cls) -> "RagSettings":
@@ -250,6 +270,22 @@ class RagSettings:
             rag_graph_entity_limit=_env_int("RAG_GRAPH_ENTITY_LIMIT", 20),
             rag_acl_enabled=_env_bool("RAG_ACL_ENABLED", True),
             rag_acl_proxy_token=_env_optional("RAG_ACL_PROXY_TOKEN"),
+            rag_governance_db_path=_env(
+                "RAG_GOVERNANCE_DB_PATH", ".cache/knowledge_governance.sqlite3"
+            ),
+            rag_upload_dir=_env("RAG_UPLOAD_DIR", ".cache/knowledge_uploads"),
+            rag_admin_max_file_bytes=_env_int(
+                "RAG_ADMIN_MAX_FILE_BYTES", 50 * 1024 * 1024
+            ),
+            rag_rerank_enabled=_env_bool("RAG_RERANK_ENABLED", False),
+            rag_rerank_model=_env(
+                "RAG_RERANK_MODEL", "BAAI/bge-reranker-v2-m3"
+            ),
+            rag_rerank_device=_env_optional("RAG_RERANK_DEVICE"),
+            rag_rerank_candidates=_env_int("RAG_RERANK_CANDIDATES", 30),
+            rag_expand_parent_context=_env_bool(
+                "RAG_EXPAND_PARENT_CONTEXT", True
+            ),
             api_title=_env("API_TITLE", "Enterprise RAG API"),
             cors_origins=_env_list("API_CORS_ORIGINS"),
         )

@@ -50,7 +50,11 @@ class IncrementalIndexingTest(unittest.TestCase):
         return chunker.split(
             Document(
                 content=text,
-                metadata={"source": "/knowledge/policy.md", "file_type": "markdown"},
+                metadata={
+                    "source": "/knowledge/policy.md",
+                    "file_type": "markdown",
+                    "tenant_id": "tenant-a",
+                },
             )
         )
 

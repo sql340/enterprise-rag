@@ -1,27 +1,43 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from access_control import PrincipalResolver
 from configs import RagSettings
 from data_processing.knowledge_indexing import (
     BaseEmbedding,
+    KnowledgeIndexer,
     OpenAICompatibleEmbedding,
     SentenceTransformerEmbedding,
 )
 from generation import OpenAICompatibleLLM
-from graph_rag import GraphRetriever, SqliteGraphStore
+from graph_rag import (
+    GraphIndexer,
+    GraphRetriever,
+    OpenAICompatibleGraphExtractor,
+    SqliteGraphStore,
+)
+from knowledge_management import (
+    KnowledgeAdminService,
+    KnowledgeGovernanceStore,
+    KnowledgeIngestionService,
+)
 from retrieval import (
     KnowledgeRetriever,
     PromptBuilder,
     QdrantVectorStore,
     RagQueryService,
 )
+from retrieval.rerank import CrossEncoderReranker
 
+from .routes.admin import router as admin_router
 from .routes.health import router as health_router
 from .routes.query import router as query_router
 
@@ -51,6 +67,13 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
             max_hops=settings.rag_graph_max_hops,
             entity_limit=settings.rag_graph_entity_limit,
         )
+    reranker = None
+    if settings.rag_rerank_enabled:
+        reranker = CrossEncoderReranker(
+            settings.rag_rerank_model,
+            device=settings.rag_rerank_device,
+            max_candidates=settings.rag_rerank_candidates,
+        )
     return RagQueryService(
         KnowledgeRetriever(
             embedding,
@@ -64,6 +87,9 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
             graph_retriever=graph_retriever,
             graph_weight=settings.rag_graph_weight,
             acl_enabled=settings.rag_acl_enabled,
+            reranker=reranker,
+            rerank_candidates=settings.rag_rerank_candidates,
+            expand_parent_context=settings.rag_expand_parent_context,
         ),
         llm,
         PromptBuilder(max_context_chars=settings.rag_max_context_chars),
@@ -72,6 +98,49 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
         default_temperature=settings.llm_temperature,
         default_max_tokens=settings.llm_max_tokens,
     )
+
+
+def build_admin_service(
+    settings: RagSettings,
+    query_service: RagQueryService | None = None,
+) -> KnowledgeAdminService:
+    """组装知识上传、构建、质量与审计服务。"""
+
+    retriever = getattr(query_service, "retriever", None)
+    embedding = getattr(retriever, "embedding", None)
+    vector_store = getattr(retriever, "vector_store", None)
+    if embedding is None:
+        embedding = _build_embedding(settings)
+    if vector_store is None:
+        vector_store = QdrantVectorStore(
+            collection_name=settings.qdrant_collection,
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+            create_payload_indexes=False,
+            text_index_field=settings.qdrant_text_index_field,
+            enable_text_index=settings.qdrant_enable_text_index,
+        )
+
+    graph_indexer = None
+    if settings.rag_graph_enabled:
+        graph_indexer = GraphIndexer(
+            SqliteGraphStore(settings.rag_graph_store_path),
+            OpenAICompatibleGraphExtractor(
+                settings.llm_model,
+                base_url=settings.llm_base_url,
+                api_key=settings.llm_api_key,
+                timeout=settings.llm_timeout,
+            ),
+        )
+    indexer = KnowledgeIndexer(embedding, vector_store, sync_scope="source")
+    ingestion = KnowledgeIngestionService(
+        governance_store=KnowledgeGovernanceStore(settings.rag_governance_db_path),
+        data_dir=settings.rag_upload_dir,
+        indexer=indexer,
+        graph_indexer=graph_indexer,
+        max_file_bytes=settings.rag_admin_max_file_bytes,
+    )
+    return KnowledgeAdminService(ingestion)
 
 
 def _build_embedding(settings: RagSettings) -> BaseEmbedding:
@@ -100,6 +169,7 @@ def _build_embedding(settings: RagSettings) -> BaseEmbedding:
 def create_app(
     *,
     service: RagQueryService | None = None,
+    admin_service: KnowledgeAdminService | None = None,
     settings: RagSettings | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用；测试时可直接注入查询服务。"""
@@ -114,6 +184,10 @@ def create_app(
         try:
             yield
         finally:
+            owned_admin = getattr(app.state, "admin_owned", False)
+            runtime_admin = getattr(app.state, "admin_service", None)
+            if owned_admin and runtime_admin is not None:
+                _close_admin_service(runtime_admin)
             await runtime.aclose()
 
     app = FastAPI(
@@ -124,6 +198,12 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.principal_resolver = PrincipalResolver(
         proxy_token=resolved_settings.rag_acl_proxy_token
+    )
+    app.state.admin_service = admin_service
+    app.state.admin_owned = admin_service is None
+    app.state.admin_service_factory = lambda: build_admin_service(
+        resolved_settings,
+        getattr(app.state, "query_service", None),
     )
     if resolved_settings.cors_origins:
         allow_all = resolved_settings.cors_origins == ("*",)
@@ -136,10 +216,31 @@ def create_app(
         )
     app.include_router(health_router)
     app.include_router(query_router)
+    app.include_router(admin_router)
+
+    ui_dir = Path(__file__).resolve().parent.parent / "ui"
+    if ui_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=ui_dir), name="ui")
+
+        @app.get("/admin", include_in_schema=False)
+        async def admin_console() -> FileResponse:
+            return FileResponse(ui_dir / "index.html")
+
     return app
+
+
+def _close_admin_service(service: KnowledgeAdminService) -> None:
+    try:
+        service.ingestion.governance_store.close()
+    finally:
+        graph_indexer = service.ingestion.graph_indexer
+        graph_store = getattr(graph_indexer, "graph_store", None)
+        close = getattr(graph_store, "close", None)
+        if close is not None:
+            close()
 
 
 app = create_app()
 
 
-__all__ = ["app", "build_query_service", "create_app"]
+__all__ = ["app", "build_admin_service", "build_query_service", "create_app"]
