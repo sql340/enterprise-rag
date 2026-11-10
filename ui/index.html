@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Atlas Knowledge Console</title>
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">A</div>
+        <div>
+          <h1>Atlas Knowledge</h1>
+          <p>企业知识治理与索引控制台</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button class="button ghost" id="refreshButton">刷新</button>
+        <button class="button ghost" id="auditButton">审计日志</button>
+        <div class="identity" id="identityChip">
+          <span class="identity-dot"></span>
+          <span id="identityText">正在验证身份…</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel upload-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">INGEST</span>
+            <h2>上传知识</h2>
+          </div>
+          <span class="badge neutral" id="capabilityBadge">格式加载中</span>
+        </div>
+
+        <form id="uploadForm">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <input id="fileInput" name="file" type="file" hidden />
+            <span class="drop-icon" aria-hidden="true">↥</span>
+            <strong id="dropTitle">拖入文件，或点击选择</strong>
+            <span id="dropHint">Markdown / PDF / Word / PPT / 表格 / 图片 / 音视频</span>
+          </label>
+
+          <div class="field-grid two">
+            <label class="field">
+              <span>分块策略</span>
+              <select id="chunkStrategy">
+                <option value="recursive">递归字符</option>
+                <option value="fixed">固定长度</option>
+                <option value="sentence_window">句子窗口</option>
+                <option value="paragraph">段落</option>
+                <option value="markdown_heading">Markdown 标题</option>
+                <option value="parent_child">父子块</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>密级</span>
+              <select id="classification">
+                <option value="public">公开</option>
+                <option value="internal" selected>内部</option>
+                <option value="confidential">机密</option>
+                <option value="secret">绝密</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="field-grid two" id="chunkNumericFields">
+            <label class="field" id="chunkSizeField">
+              <span>Chunk Size</span>
+              <input id="chunkSize" type="number" min="1" value="600" />
+            </label>
+            <label class="field" id="chunkOverlapField">
+              <span>Overlap</span>
+              <input id="chunkOverlap" type="number" min="0" value="80" />
+            </label>
+            <label class="field hidden" id="parentSizeField">
+              <span>父块大小</span>
+              <input id="parentSize" type="number" min="1" value="2048" />
+            </label>
+          </div>
+
+          <details class="acl-details">
+            <summary>访问权限</summary>
+            <div class="details-body">
+              <label class="field">
+                <span>允许角色（逗号分隔）</span>
+                <input id="allowedRoles" placeholder="finance, hr" />
+              </label>
+              <label class="field">
+                <span>允许用户组</span>
+                <input id="allowedGroups" placeholder="audit, leadership" />
+              </label>
+              <label class="field">
+                <span>允许用户</span>
+                <input id="allowedUsers" placeholder="user-1, user-2" />
+              </label>
+            </div>
+          </details>
+
+          <button class="button primary full" id="uploadButton" type="submit">
+            上传并解析预览
+          </button>
+          <p class="form-status" id="uploadStatus"></p>
+        </form>
+
+        <section class="preview-card hidden" id="previewCard">
+          <div class="preview-head">
+            <div>
+              <span class="eyebrow">PREVIEW</span>
+              <h3 id="previewTitle">解析预览</h3>
+            </div>
+            <button class="icon-button" id="closePreview" title="关闭">×</button>
+          </div>
+          <div class="metric-row" id="previewMetrics"></div>
+          <div class="quality-strip" id="previewQuality"></div>
+          <div class="sample-list" id="previewSamples"></div>
+          <button class="button accent full" id="buildButton">开始构建索引</button>
+          <p class="form-status" id="buildStatus"></p>
+        </section>
+      </section>
+
+      <section class="content-column">
+        <div class="content-toolbar panel">
+          <div>
+            <span class="eyebrow">LIBRARY</span>
+            <h2>知识资产</h2>
+          </div>
+          <div class="toolbar-controls">
+            <select id="statusFilter" class="compact-select">
+              <option value="">全部状态</option>
+              <option value="succeeded">已构建</option>
+              <option value="queued">排队中</option>
+              <option value="running">构建中</option>
+              <option value="failed">失败</option>
+              <option value="archived">已归档</option>
+            </select>
+            <select id="qualityFilter" class="compact-select">
+              <option value="">全部质量</option>
+              <option value="unreviewed">待复核</option>
+              <option value="good">高质量</option>
+              <option value="needs_rework">需重做</option>
+              <option value="blocked">已阻断</option>
+            </select>
+            <button class="button subtle" id="rebuildQualityButton">重建待复核</button>
+          </div>
+        </div>
+
+        <div class="document-list" id="documentList"></div>
+        <div class="empty-state hidden" id="emptyState">
+          <span>◇</span>
+          <h3>还没有知识文档</h3>
+          <p>从左侧上传第一份材料，解析预览后即可构建索引。</p>
+        </div>
+
+        <section class="panel jobs-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">PIPELINE</span>
+              <h2>构建任务</h2>
+            </div>
+            <span class="badge neutral" id="activeJobCount">0 运行中</span>
+          </div>
+          <div class="job-list" id="jobList"></div>
+        </section>
+      </section>
+    </main>
+
+    <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+    <aside class="drawer" id="auditDrawer" aria-hidden="true">
+      <div class="drawer-head">
+        <div>
+          <span class="eyebrow">AUDIT</span>
+          <h2>审计日志</h2>
+        </div>
+        <button class="icon-button" id="closeAudit" title="关闭">×</button>
+      </div>
+      <div class="audit-list" id="auditList"></div>
+    </aside>
+
+    <div class="modal-backdrop hidden" id="aclModalBackdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="aclModalTitle">
+        <div class="modal-head">
+          <div>
+            <span class="eyebrow">ACCESS</span>
+            <h2 id="aclModalTitle">编辑文档权限</h2>
+          </div>
+          <button class="icon-button" id="closeAclModal" title="关闭">×</button>
+        </div>
+        <form id="aclForm">
+          <label class="field">
+            <span>密级</span>
+            <select id="aclClassification">
+              <option value="public">公开</option>
+              <option value="internal">内部</option>
+              <option value="confidential">机密</option>
+              <option value="secret">绝密</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>允许角色</span>
+            <input id="aclRoles" />
+          </label>
+          <label class="field">
+            <span>允许用户组</span>
+            <input id="aclGroups" />
+          </label>
+          <label class="field">
+            <span>允许用户</span>
+            <input id="aclUsers" />
+          </label>
+          <button class="button primary full" type="submit">保存权限</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="toast-stack" id="toastStack"></div>
+    <script src="/ui/app.js" defer></script>
+  </body>
+</html>

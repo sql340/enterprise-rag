@@ -8,7 +8,7 @@ from qdrant_client import QdrantClient
 from access_control import AccessControlError, Classification, DocumentAcl, Principal
 from api.QueryRequest import QueryRequest
 from configs import RagSettings
-from data_processing.chunker import Chunk
+from data_processing.chunker import Chunk, TenantChunkScope
 from data_processing.knowledge_indexing import BaseEmbedding
 from graph_rag import (
     BaseGraphExtractor,
@@ -336,12 +336,23 @@ class GraphRagIntegrationTest(unittest.TestCase):
                 ),
             ),
         ]
+        self.scoped_chunks = TenantChunkScope.apply(self.chunks, "tenant-a")
+        self.document_ids = {
+            scoped.document_id: original.document_id
+            for scoped, original in zip(
+                self.scoped_chunks,
+                self.chunks,
+                strict=True,
+            )
+        }
         self.vector_store.upsert_chunks(
-            self.chunks,
-            [[1.0, 0.0] for _ in self.chunks],
+            self.scoped_chunks,
+            [[1.0, 0.0] for _ in self.scoped_chunks],
             embedding_model="fake-graph-embedding",
         )
-        GraphIndexer(self.graph_store, FakeGraphExtractor()).index_chunks(self.chunks)
+        GraphIndexer(self.graph_store, FakeGraphExtractor()).index_chunks(
+            self.scoped_chunks
+        )
         self.retriever = KnowledgeRetriever(
             FakeEmbedding(),
             self.vector_store,
@@ -358,6 +369,12 @@ class GraphRagIntegrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.retriever.close()
 
+    def _logical_document_ids(self, results) -> set[str]:
+        return {
+            self.document_ids.get(result.document_id, result.document_id)
+            for result in results
+        }
+
     def test_graph_route_excludes_unauthorized_chunks(self) -> None:
         results = self.retriever.retrieve(
             "Alice",
@@ -367,7 +384,7 @@ class GraphRagIntegrationTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            {result.document_id for result in results},
+            self._logical_document_ids(results),
             {"d1", "d2"},
         )
         self.assertTrue(all("graph" in result.route_scores for result in results))
@@ -380,7 +397,7 @@ class GraphRagIntegrationTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            {result.document_id for result in results},
+            self._logical_document_ids(results),
             {"d1", "d2"},
         )
         self.assertTrue(all(result.retrieval_mode == "hybrid_rrf" for result in results))
@@ -402,15 +419,16 @@ class GraphRagIntegrationTest(unittest.TestCase):
             )
             for index in range(8)
         ]
+        scoped_private_chunks = TenantChunkScope.apply(private_chunks, "tenant-a")
         self.vector_store.upsert_chunks(
-            private_chunks,
-            [[1.0, 0.0] for _ in private_chunks],
+            scoped_private_chunks,
+            [[1.0, 0.0] for _ in scoped_private_chunks],
             embedding_model="fake-graph-embedding",
         )
         GraphIndexer(
             self.graph_store,
             FakeGraphExtractor(),
-        ).index_chunks(private_chunks)
+        ).index_chunks(scoped_private_chunks)
 
         results = self.retriever.retrieve(
             "Alice Project Atlas",
@@ -420,7 +438,10 @@ class GraphRagIntegrationTest(unittest.TestCase):
         )
 
         self.assertEqual(len(results), 1)
-        self.assertIn(results[0].document_id, {"d1", "d2"})
+        self.assertIn(
+            self.document_ids.get(results[0].document_id, results[0].document_id),
+            {"d1", "d2"},
+        )
         self.assertEqual(results[0].route_ranks["graph"], 1)
 
     def test_graph_route_requires_principal(self) -> None:

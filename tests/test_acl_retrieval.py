@@ -55,8 +55,8 @@ class AclRetrievalIntegrationTest(unittest.TestCase):
             file_type: str = "markdown",
         ) -> None:
             document_id = f"doc-{name}"
-            documents[name] = document_id
-            self._index_document(document_id, acl, file_type=file_type)
+            result = self._index_document(document_id, acl, file_type=file_type)
+            documents[name] = result.document_ids[0]
 
         index(
             "public",
@@ -137,8 +137,8 @@ class AclRetrievalIntegrationTest(unittest.TestCase):
                 owner_id="u2",
             ),
         )
-        self._index_document("doc-legacy", None)
-        documents["legacy"] = "doc-legacy"
+        legacy = self._index_document("doc-legacy", None, tenant_id="tenant-a")
+        documents["legacy"] = legacy.document_ids[0]
         return documents
 
     def _index_document(
@@ -146,8 +146,9 @@ class AclRetrievalIntegrationTest(unittest.TestCase):
         document_id: str,
         acl: DocumentAcl | None,
         *,
+        tenant_id: str | None = None,
         file_type: str = "markdown",
-    ) -> None:
+    ):
         chunk_id = uuid.uuid5(uuid.NAMESPACE_URL, document_id).hex
         content = f"policy {document_id}"
         chunk = Chunk(
@@ -164,7 +165,11 @@ class AclRetrievalIntegrationTest(unittest.TestCase):
                 "file_type": file_type,
             },
         )
-        self.indexer.index_chunks([chunk], acl=acl)
+        return self.indexer.index_chunks(
+            [chunk],
+            acl=acl,
+            tenant_id=acl.tenant_id if acl is not None else tenant_id,
+        )
 
     def _visible_names(self, principal: Principal) -> set[str]:
         results = self.retriever.retrieve("policy", top_k=20, principal=principal)

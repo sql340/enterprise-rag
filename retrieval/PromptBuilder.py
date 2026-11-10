@@ -52,7 +52,7 @@ class PromptBuilder:
         remaining = self.max_context_chars
         parts: list[str] = []
         for index, source in enumerate(sources, start=1):
-            content = source.content.strip()
+            content = source.context_content.strip()
             if not content:
                 continue
             header = self._source_header(index, source)

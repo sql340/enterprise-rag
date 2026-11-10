@@ -346,6 +346,7 @@ class QdrantVectorStore(BaseVectorStore):
         chunks: Sequence[Chunk],
         vectors: Sequence[Sequence[float]],
         *,
+        tenant_id: str,
         embedding_model: str,
         scope: str = "source",
         delete_stale: bool = True,
@@ -354,6 +355,7 @@ class QdrantVectorStore(BaseVectorStore):
         chunk_values = list(chunks)
         if not chunk_values:
             return 0
+        self._require_chunk_tenant(chunk_values, tenant_id)
 
         scope_field, scope_value = self._scope_identity(chunk_values, scope)
         indexed = self.upsert_chunks(
@@ -370,6 +372,7 @@ class QdrantVectorStore(BaseVectorStore):
             else [chunk.chunk_id for chunk in chunk_values]
         )
         self.prune_stale_chunks(
+            tenant_id=tenant_id,
             scope_field=scope_field,
             scope_value=scope_value,
             expected_chunk_ids=active_chunk_ids,
@@ -398,15 +401,29 @@ class QdrantVectorStore(BaseVectorStore):
             )
         return field_name, next(iter(values))
 
-    def _scroll_chunk_ids(self, field_name: str, value: str) -> set[str]:
-        return set(self.list_chunk_records(scope_field=field_name, scope_value=value))
+    def _scroll_chunk_ids(
+        self,
+        *,
+        tenant_id: str,
+        field_name: str,
+        value: str,
+    ) -> set[str]:
+        return set(
+            self.list_chunk_records(
+                tenant_id=tenant_id,
+                scope_field=field_name,
+                scope_value=value,
+            )
+        )
 
     def list_chunk_records(
         self,
         *,
+        tenant_id: str,
         scope_field: str,
         scope_value: str,
     ) -> dict[str, dict[str, Any]]:
+        tenant = self._require_tenant(tenant_id)
         if not scope_field.strip() or not scope_value:
             raise ValueError("scope_field 和 scope_value 不能为空")
         if not self.client.collection_exists(self.collection_name):
@@ -414,6 +431,10 @@ class QdrantVectorStore(BaseVectorStore):
 
         scroll_filter = models.Filter(
             must=[
+                models.FieldCondition(
+                    key="tenant_id",
+                    match=models.MatchValue(value=tenant),
+                ),
                 models.FieldCondition(
                     key=scope_field,
                     match=models.MatchValue(value=scope_value),
@@ -453,15 +474,18 @@ class QdrantVectorStore(BaseVectorStore):
     def prune_stale_chunks(
         self,
         *,
+        tenant_id: str,
         scope_field: str,
         scope_value: str,
         expected_chunk_ids: Sequence[str],
     ) -> int:
         expected = {str(chunk_id) for chunk_id in expected_chunk_ids}
+        tenant = self._require_tenant(tenant_id)
         if not expected:
             raise ValueError("expected_chunk_ids 不能为空，避免误删整个同步范围")
         existing = set(
             self.list_chunk_records(
+                tenant_id=tenant,
                 scope_field=scope_field,
                 scope_value=scope_value,
             )
@@ -483,9 +507,12 @@ class QdrantVectorStore(BaseVectorStore):
 
     def update_payload_by_document(
         self,
+        *,
+        tenant_id: str,
         document_id: str,
         payload: Mapping[str, Any],
     ) -> None:
+        tenant = self._require_tenant(tenant_id)
         if not document_id:
             raise ValueError("document_id 不能为空")
         if not payload:
@@ -497,6 +524,10 @@ class QdrantVectorStore(BaseVectorStore):
             payload=_json_safe(dict(payload)),
             points=models.Filter(
                 must=[
+                    models.FieldCondition(
+                        key="tenant_id",
+                        match=models.MatchValue(value=tenant),
+                    ),
                     models.FieldCondition(
                         key="document_id",
                         match=models.MatchValue(value=document_id),
@@ -701,6 +732,27 @@ class QdrantVectorStore(BaseVectorStore):
                 )
         return models.Filter(must=conditions) if conditions else None
 
+    @staticmethod
+    def _require_tenant(tenant_id: str) -> str:
+        tenant = str(tenant_id).strip()
+        if not tenant:
+            raise ValueError("tenant_id 不能为空")
+        return tenant
+
+    @classmethod
+    def _require_chunk_tenant(
+        cls,
+        chunks: Sequence[Chunk],
+        tenant_id: str,
+    ) -> str:
+        tenant = cls._require_tenant(tenant_id)
+        values = {
+            str(chunk.metadata.get("tenant_id") or "").strip() for chunk in chunks
+        }
+        if values != {tenant}:
+            raise ValueError("知识块 tenant_id 与写入租户不一致")
+        return tenant
+
     def merge_filters(self, *filters: Any) -> Any:
         values = [
             self._build_filter(value)
@@ -714,7 +766,8 @@ class QdrantVectorStore(BaseVectorStore):
             return values[0]
         return models.Filter(must=values)
 
-    def delete_by_document(self, document_id: str) -> None:
+    def delete_by_document(self, *, tenant_id: str, document_id: str) -> None:
+        tenant = self._require_tenant(tenant_id)
         if not document_id:
             raise ValueError("document_id 不能为空")
         if not self.client.collection_exists(self.collection_name):
@@ -724,6 +777,10 @@ class QdrantVectorStore(BaseVectorStore):
             points_selector=models.Filter(
                 must=[
                     models.FieldCondition(
+                        key="tenant_id",
+                        match=models.MatchValue(value=tenant),
+                    ),
+                    models.FieldCondition(
                         key="document_id",
                         match=models.MatchValue(value=document_id),
                     )
@@ -732,7 +789,8 @@ class QdrantVectorStore(BaseVectorStore):
             wait=True,
         )
 
-    def delete_by_source(self, source: str) -> None:
+    def delete_by_source(self, *, tenant_id: str, source: str) -> None:
+        tenant = self._require_tenant(tenant_id)
         if not source:
             raise ValueError("source 不能为空")
         if not self.client.collection_exists(self.collection_name):
@@ -741,6 +799,10 @@ class QdrantVectorStore(BaseVectorStore):
             collection_name=self.collection_name,
             points_selector=models.Filter(
                 must=[
+                    models.FieldCondition(
+                        key="tenant_id",
+                        match=models.MatchValue(value=tenant),
+                    ),
                     models.FieldCondition(
                         key="source",
                         match=models.MatchValue(value=source),

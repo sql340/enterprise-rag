@@ -9,6 +9,7 @@ from data_processing.knowledge_indexing import BaseEmbedding
 from graph_rag import GraphRetriever, GraphSearchHit
 
 from .RrfFusion import RrfFusion
+from .rerank import BaseReranker
 from .vector_store import BaseVectorStore, VectorSearchResult
 
 
@@ -32,6 +33,9 @@ class KnowledgeRetriever:
         graph_retriever: GraphRetriever | None = None,
         graph_weight: float = 0.8,
         acl_enabled: bool = False,
+        reranker: BaseReranker | None = None,
+        rerank_candidates: int = 0,
+        expand_parent_context: bool = False,
     ) -> None:
         if candidate_multiplier <= 0:
             raise ValueError("candidate_multiplier 必须为正整数")
@@ -39,6 +43,8 @@ class KnowledgeRetriever:
             raise ValueError("max_candidates 必须为正整数")
         if dense_weight < 0 or keyword_weight < 0 or graph_weight < 0:
             raise ValueError("检索路权重不能为负数")
+        if rerank_candidates < 0:
+            raise ValueError("rerank_candidates 不能为负数")
 
         self.embedding = embedding
         self.vector_store = vector_store
@@ -51,6 +57,9 @@ class KnowledgeRetriever:
         self.graph_retriever = graph_retriever
         self.graph_weight = graph_weight
         self.acl_enabled = acl_enabled
+        self.reranker = reranker
+        self.rerank_candidates = rerank_candidates
+        self.expand_parent_context = expand_parent_context
 
     def retrieve(
         self,
@@ -74,27 +83,44 @@ class KnowledgeRetriever:
         )
         effective_filters = self._effective_filters(filters, principal)
         if mode == "graph":
-            return self._graph_search(
+            graph_limit = self._candidate_limit(top_k)
+            return self._finalize(
                 question,
+                self._graph_search(
+                    question,
+                    filters=effective_filters,
+                    principal=principal,
+                    limit=graph_limit,
+                ),
+                top_k=top_k,
                 filters=effective_filters,
-                principal=principal,
-                limit=top_k,
             )
 
         query_vector = self.embedding.embed_query(question.strip())
         if mode == "dense":
-            return self._dense_search(
+            dense_results = self._dense_search(
                 query_vector,
-                limit=top_k,
+                limit=self._candidate_limit(top_k),
                 score_threshold=score_threshold,
                 filters=effective_filters,
                 retrieval_mode="dense",
+            )
+            return self._finalize(
+                question,
+                dense_results,
+                top_k=top_k,
+                filters=effective_filters,
             )
 
         candidate_limit = min(
             self.max_candidates,
             max(top_k, top_k * self.candidate_multiplier),
         )
+        if self.reranker is not None:
+            candidate_limit = min(
+                self.max_candidates,
+                max(candidate_limit, self._candidate_limit(top_k)),
+            )
         dense_results = self._dense_search(
             query_vector,
             limit=candidate_limit,
@@ -125,17 +151,86 @@ class KnowledgeRetriever:
                 routes["graph"] = graph_results
 
         if len(routes) == 1:
-            return dense_results[:top_k]
-
-        return self.rrf_fusion.fuse(
-            routes,
-            limit=top_k,
-            weights={
-                "dense": self.dense_weight,
-                "keyword": self.keyword_weight,
-                "graph": self.graph_weight,
-            },
+            fused = dense_results
+        else:
+            fused = self.rrf_fusion.fuse(
+                routes,
+                limit=candidate_limit if self.reranker is not None else top_k,
+                weights={
+                    "dense": self.dense_weight,
+                    "keyword": self.keyword_weight,
+                    "graph": self.graph_weight,
+                },
+            )
+        return self._finalize(
+            question,
+            fused,
+            top_k=top_k,
+            filters=effective_filters,
         )
+
+    def _candidate_limit(self, top_k: int) -> int:
+        if self.reranker is None:
+            return top_k
+        requested = self.rerank_candidates or top_k * self.candidate_multiplier
+        return min(self.max_candidates, max(top_k, requested))
+
+    def _finalize(
+        self,
+        question: str,
+        results: Sequence[VectorSearchResult],
+        *,
+        top_k: int,
+        filters: Mapping[str, Any] | Any | None,
+    ) -> list[VectorSearchResult]:
+        values = list(results)
+        if self.reranker is not None:
+            try:
+                values = self.reranker.rerank(question, values, top_k=top_k)
+            except Exception as exc:
+                logger.warning("重排失败，退回融合排序: %s", exc)
+                values = values[:top_k]
+        else:
+            values = values[:top_k]
+        if self.expand_parent_context:
+            return self._expand_parent_context(values, filters=filters)
+        return values
+
+    def _expand_parent_context(
+        self,
+        results: Sequence[VectorSearchResult],
+        *,
+        filters: Mapping[str, Any] | Any | None,
+    ) -> list[VectorSearchResult]:
+        values = list(results)
+        parent_ids = list(
+            dict.fromkeys(
+                str(item.payload.get("parent_id"))
+                for item in values
+                if item.payload.get("parent_id")
+                and str(item.payload.get("parent_id")) != item.chunk_id
+            )
+        )
+        if not parent_ids:
+            return values
+        getter = getattr(self.vector_store, "get_chunks_by_ids", None)
+        if getter is None:
+            return values
+        try:
+            parents = getter(parent_ids, filters=filters)
+        except Exception as exc:
+            logger.warning("父块上下文扩展失败，保留原始知识块: %s", exc)
+            return values
+        parents_by_id = {item.chunk_id: item for item in parents}
+        for item in values:
+            parent_id = str(item.payload.get("parent_id") or "")
+            parent = parents_by_id.get(parent_id)
+            if parent is None:
+                continue
+            item.payload["context_content"] = parent.content
+            item.payload["parent_chunk_id"] = parent.chunk_id
+            item.payload["parent_expanded"] = True
+        return values
 
     def _dense_search(
         self,

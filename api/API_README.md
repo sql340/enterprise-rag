@@ -3,6 +3,8 @@
 在线模块负责“查询向量化 → Qdrant 召回 → Prompt 编排 → LLM 流式生成”。
 HTTP 接口使用 FastAPI，查询结果通过 SSE（Server-Sent Events）流式返回。
 
+同一服务还提供 `/v1/admin` 知识治理接口和 `/admin` 入库控制台。
+
 ## 启动
 
 ```bash
@@ -24,6 +26,7 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 - OpenAPI：`http://localhost:8080/docs`
 - 健康检查：`GET /health`
 - 流式问答：`POST /v1/query`
+- 知识控制台：`GET /admin`
 
 至少需要配置：
 
@@ -179,6 +182,33 @@ Graph RAG 需要先用 `GraphIndexer` 构建实体关系。图谱只返回候选
 ACL 启用前已经入库、没有 `tenant_id` 和 ACL payload 的旧知识块默认不可见。
 需要为这些文档补齐 ACL 并重新入库，不能依赖兼容模式放宽过滤。
 
+## 知识管理 API
+
+所有 `/v1/admin/**` 接口都要求同一套可信身份头，并且角色中必须包含
+`knowledge_admin` 或 `platform_admin`。管理身份解析也要求配置
+`RAG_ACL_PROXY_TOKEN`，未配置时返回 503，不会退回到信任裸请求头。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v1/admin/me` | 当前管理身份 |
+| `GET /v1/admin/capabilities` | 支持的文件格式与分块策略 |
+| `POST /v1/admin/documents/upload` | multipart 上传文件，设置 ACL 与分块参数 |
+| `GET /v1/admin/documents` | 文档清单，可按状态/质量过滤 |
+| `GET /v1/admin/documents/{id}` | 文档详情 |
+| `POST /v1/admin/documents/{id}/preview` | 解析、分块和质量预览 |
+| `POST /v1/admin/documents/{id}/jobs` | 创建异步构建任务 |
+| `GET /v1/admin/jobs/{job_id}` | 任务状态与构建报告 |
+| `POST /v1/admin/jobs/{job_id}/retry` | 重试失败任务 |
+| `PATCH /v1/admin/documents/{id}/acl` | 更新权限并同步 Qdrant payload |
+| `PATCH /v1/admin/documents/{id}/quality` | 人工复核质量状态 |
+| `PATCH /v1/admin/documents/{id}/config` | 修改分块策略和参数 |
+| `POST /v1/admin/documents/rebuild` | 按质量状态批量重建 |
+| `DELETE /v1/admin/documents/{id}` | 归档；`delete_vectors=true` 时清理向量 |
+| `GET /v1/admin/audit` | 当前租户审计日志 |
+
+上传文件使用随机 ID 落盘，原始文件名只保留 basename；路径中的租户片段会被
+安全化，避免目录穿越。默认单文件上限由 `RAG_ADMIN_MAX_FILE_BYTES` 控制。
+
 ## Python 客户端
 
 ```python
@@ -246,6 +276,19 @@ graph_rag/
 ├── GraphRetriever.py         # 按实体和邻居召回 chunk_id
 ├── SqliteGraphStore.py       # 单机图谱存储
 └── OpenAICompatibleGraphExtractor.py # LLM 实体关系抽取
+knowledge_management/
+├── KnowledgeAdminService.py  # 管理 API 授权与适配
+├── KnowledgeIngestionService.py
+├── KnowledgeGovernanceStore.py
+├── KnowledgeBuildFingerprint.py
+└── ChunkQualityAnalyzer.py
+retrieval/rerank/
+├── CrossEncoderReranker.py
+└── BaseReranker.py
+evaluation/
+├── EvaluationRunner.py
+├── RetrievalMetrics.py
+└── EvaluationReportStore.py
 ```
 
 ## 生产注意事项

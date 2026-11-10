@@ -19,6 +19,7 @@ from .ParagraphChunker import ParagraphChunker
 from .ParentChildChunker import ParentChildChunker
 from .RecursiveChunker import RecursiveChunker
 from .SentenceWindowChunker import SentenceWindowChunker
+from .TenantChunkScope import TenantChunkScope
 from .Chunker import Chunker, chunk_documents, create_chunker
 from ._utils import DEFAULT_SEPARATORS, DocumentLike, LengthFunction
 
@@ -36,6 +37,7 @@ __all__ = [
     "ParentChildChunker",
     "RecursiveChunker",
     "SentenceWindowChunker",
+    "TenantChunkScope",
     "chunk_documents",
     "create_chunker",
 ]

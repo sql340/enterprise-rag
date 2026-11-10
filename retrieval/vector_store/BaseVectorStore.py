@@ -32,6 +32,7 @@ class BaseVectorStore(ABC):
         chunks: Sequence[Chunk],
         vectors: Sequence[Sequence[float]],
         *,
+        tenant_id: str,
         embedding_model: str,
         scope: str = "source",
         delete_stale: bool = True,
@@ -90,6 +91,7 @@ class BaseVectorStore(ABC):
     def list_chunk_records(
         self,
         *,
+        tenant_id: str,
         scope_field: str,
         scope_value: str,
     ) -> dict[str, dict[str, Any]]:
@@ -100,6 +102,7 @@ class BaseVectorStore(ABC):
     def prune_stale_chunks(
         self,
         *,
+        tenant_id: str,
         scope_field: str,
         scope_value: str,
         expected_chunk_ids: Sequence[str],
@@ -110,6 +113,8 @@ class BaseVectorStore(ABC):
 
     def update_payload_by_document(
         self,
+        *,
+        tenant_id: str,
         document_id: str,
         payload: Mapping[str, Any],
     ) -> None:
@@ -118,7 +123,7 @@ class BaseVectorStore(ABC):
         raise NotImplementedError("当前向量库不支持原地更新文档 payload")
 
     @abstractmethod
-    def delete_by_document(self, document_id: str) -> None:
+    def delete_by_document(self, *, tenant_id: str, document_id: str) -> None:
         """删除一个文档版本下的全部向量。"""
 
     @abstractmethod

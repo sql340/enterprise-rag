@@ -1,0 +1,18 @@
+{
+  "name": "enterprise-rag-smoke",
+  "metadata": {
+    "description": "替换 expected_* 为当前租户真实 chunk/document ID 后使用"
+  },
+  "cases": [
+    {
+      "case_id": "reimbursement-001",
+      "question": "差旅结束后多久内提交报销？",
+      "expected_chunk_ids": ["replace-with-real-chunk-id"]
+    },
+    {
+      "case_id": "project-approval-001",
+      "question": "项目立项需要哪些角色审批？",
+      "expected_document_ids": ["replace-with-real-document-id"]
+    }
+  ]
+}

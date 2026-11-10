@@ -20,6 +20,12 @@ class VectorSearchResult:
         return str(self.payload.get("content", ""))
 
     @property
+    def context_content(self) -> str:
+        """送入 Prompt 的正文；父块扩展时可替换为完整父块内容。"""
+
+        return str(self.payload.get("context_content") or self.content)
+
+    @property
     def chunk_id(self) -> str:
         return str(self.payload.get("chunk_id") or self.id)
 
@@ -39,6 +45,7 @@ class VectorSearchResult:
             "retrieval_mode": self.retrieval_mode,
             "route_scores": dict(self.route_scores),
             "route_ranks": dict(self.route_ranks),
+            "parent_chunk_id": self.payload.get("parent_chunk_id"),
         }
 
 

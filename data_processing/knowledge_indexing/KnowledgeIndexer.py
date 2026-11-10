@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 from access_control import DocumentAcl
-from data_processing.chunker import Chunk, Chunker, DocumentLike
+from data_processing.chunker import Chunk, Chunker, DocumentLike, TenantChunkScope
 from retrieval.vector_store import BaseVectorStore
 
 from .BaseEmbedding import BaseEmbedding
@@ -54,6 +54,7 @@ class KnowledgeIndexer:
         self,
         chunks: Sequence[Chunk],
         *,
+        tenant_id: str | None = None,
         sync_scope: str | None = None,
         delete_stale: bool | None = None,
         force_reindex: bool | None = None,
@@ -69,12 +70,23 @@ class KnowledgeIndexer:
         values = [chunk for chunk in chunks if chunk.content.strip()]
         if not values:
             raise ValueError("chunks 中没有可向量化的文本")
+        resolved_tenant = self._resolve_tenant(
+            values,
+            tenant_id=tenant_id,
+            acl=active_acl,
+        )
         if active_acl is not None:
             acl_payload = active_acl.to_payload()
             values = [
                 replace(chunk, metadata={**chunk.metadata, **acl_payload})
                 for chunk in values
             ]
+        else:
+            values = [
+                replace(chunk, metadata={**chunk.metadata, "tenant_id": resolved_tenant})
+                for chunk in values
+            ]
+        values = TenantChunkScope.apply(values, resolved_tenant)
 
         scope = self._normalise_scope(sync_scope or self.sync_scope)
         should_delete_stale = (
@@ -88,9 +100,10 @@ class KnowledgeIndexer:
         skipped = 0
         stale_deleted = 0
 
-        for (scope_field, scope_value), group_chunks in groups.items():
+        for (group_tenant, scope_field, scope_value), group_chunks in groups.items():
             existing = (
                 self.vector_store.list_chunk_records(
+                    tenant_id=group_tenant,
                     scope_field=scope_field,
                     scope_value=scope_value,
                 )
@@ -123,6 +136,7 @@ class KnowledgeIndexer:
 
             if should_delete_stale:
                 stale_deleted += self.vector_store.prune_stale_chunks(
+                    tenant_id=group_tenant,
                     scope_field=scope_field,
                     scope_value=scope_value,
                     expected_chunk_ids=[chunk.chunk_id for chunk in group_chunks],
@@ -167,8 +181,9 @@ class KnowledgeIndexer:
         if not isinstance(acl, DocumentAcl):
             raise TypeError("acl 必须是 DocumentAcl")
         self.vector_store.update_payload_by_document(
-            document_id,
-            acl.to_payload(),
+            tenant_id=acl.tenant_id,
+            document_id=document_id,
+            payload=acl.to_payload(),
         )
 
     @property
@@ -202,16 +217,46 @@ class KnowledgeIndexer:
     def _group_chunks(
         chunks: Sequence[Chunk],
         scope: str,
-    ) -> dict[tuple[str, str], list[Chunk]]:
-        groups: dict[tuple[str, str], list[Chunk]] = {}
+    ) -> dict[tuple[str, str, str], list[Chunk]]:
+        groups: dict[tuple[str, str, str], list[Chunk]] = {}
         for chunk in chunks:
+            tenant_id = str(chunk.metadata.get("tenant_id") or "").strip()
+            if not tenant_id:
+                raise ValueError("知识块缺少 tenant_id，不能按范围同步")
             source = chunk.metadata.get("source")
             if scope == "source" and source:
-                key = ("source", str(source))
+                key = (tenant_id, "source", str(source))
             else:
-                key = ("document_id", chunk.document_id)
+                key = (tenant_id, "document_id", chunk.document_id)
             groups.setdefault(key, []).append(chunk)
         return groups
+
+    @staticmethod
+    def _resolve_tenant(
+        chunks: Sequence[Chunk],
+        *,
+        tenant_id: str | None,
+        acl: DocumentAcl | None,
+    ) -> str:
+        explicit = str(tenant_id).strip() if tenant_id is not None else ""
+        acl_tenant = acl.tenant_id if acl is not None else ""
+        if explicit and acl_tenant and explicit != acl_tenant:
+            raise ValueError("tenant_id 与 acl.tenant_id 不一致")
+        resolved = explicit or acl_tenant
+        metadata_tenants = {
+            str(chunk.metadata.get("tenant_id") or "").strip() for chunk in chunks
+        } - {""}
+        if not resolved:
+            if not metadata_tenants:
+                raise ValueError(
+                    "知识入库必须提供 tenant_id 或 DocumentAcl，避免跨租户数据混写"
+                )
+            if len(metadata_tenants) != 1:
+                raise ValueError("同一批知识块包含多个 tenant_id")
+            resolved = next(iter(metadata_tenants))
+        if metadata_tenants and metadata_tenants != {resolved}:
+            raise ValueError("知识块 tenant_id 与目标租户不一致")
+        return resolved
 
 
 __all__ = ["KnowledgeIndexer"]
