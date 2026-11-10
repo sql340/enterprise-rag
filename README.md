@@ -26,7 +26,12 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 ```
 
 流式查询接口为 `POST /v1/query`，知识入库控制台位于 `/admin`，OpenAPI
-文档位于 `/docs`。
+文档位于 `/docs`。`GET /health` 只检查进程存活；`GET /ready` 会检查 Qdrant
+collection、ACL/BM25 索引、构建 worker 和管理服务，未就绪时返回 503。
+
+生产启动时默认自动创建缺失的 Qdrant collection，并补齐 `tenant_id`、ACL 字段
+和 BM25 文本索引。构建任务由持久化 SQLite worker 通过租约领取，进程重启后会
+恢复 pending 和租约过期的 running 任务；多实例部署必须共享同一个治理库存储卷。
 
 完整的数据处理、分块、向量化和检索示例见
 [`data_processing/DATA_PROCESSING_README.md`](data_processing/DATA_PROCESSING_README.md)。
@@ -71,6 +76,13 @@ dense + BM25 的原始 RAG 行为。
 `tenant_id` 同时进入知识块 ID 哈希、Qdrant payload 过滤、图谱键和治理库查询。
 两个租户上传相同路径和相同内容时不会产生相同的 `document_id/chunk_id`，也
 不会互相清理旧块。管理接口只使用可信网关注入的租户身份，不能由请求体覆盖。
+
+## 任务恢复
+
+知识构建不再依赖 Web 请求进程内的临时后台任务。任务写入 SQLite 后，由
+`IngestionJobWorker` 原子领取并定期续租；worker 崩溃或实例重启后，任务租约
+过期即可被其它实例接管。超过 `RAG_INGESTION_MAX_ATTEMPTS` 的僵尸任务会被
+标记失败，避免无限重试。
 
 ## 知识质量闭环
 

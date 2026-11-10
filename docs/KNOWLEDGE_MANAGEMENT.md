@@ -9,6 +9,8 @@
 knowledge_management/
 ├── KnowledgeDocument.py          # 文档清单与构建指纹
 ├── IngestionJob.py               # 持久化任务
+├── IngestionJobLeaseError.py     # 租约失效异常
+├── IngestionJobWorker.py         # 原子领取、续租与重启恢复
 ├── AuditEvent.py                 # 审计事件
 ├── KnowledgeGovernanceStore.py   # SQLite 文档/任务/审计存储
 ├── KnowledgeIngestionService.py  # 入库业务编排
@@ -100,9 +102,25 @@ ACL 更新直接写入 Qdrant payload，不重算向量；归档会先切换 ACL
 
 ## 异步任务边界
 
-当前 API 使用 FastAPI `BackgroundTasks` 执行构建，任务状态持久化在 SQLite。
-这适合单实例或小规模部署。多实例生产部署需要替换为 Redis/RQ、Celery、
-Dramatiq 或云队列，并为任务增加租约、心跳、并发限制和超时回收。
+构建任务持久化在 SQLite，由进程内 `IngestionJobWorker` 轮询领取，不再依赖
+FastAPI 请求生命周期内的 `BackgroundTasks`。领取任务使用 `BEGIN IMMEDIATE`
+原子事务，并通过 `worker_id + lease_expires_at` 防止多个实例重复处理。
+
+worker 在任务开始、解析、分块、向量化、图谱构建和完成前续租。实例崩溃或重启
+后，pending 任务以及租约过期的 running 任务会被新 worker 接管；同一任务累计
+尝试超过 `RAG_INGESTION_MAX_ATTEMPTS` 后会标记失败。失去租约的旧 worker 不会
+继续覆盖任务状态。
+
+多实例部署必须共享同一个 `RAG_GOVERNANCE_DB_PATH` 和上传目录，并使用支持
+SQLite 文件锁的本地/共享块存储。更大规模或跨地域部署仍建议将任务表替换为
+Redis/RQ、Celery 或云队列。
 
 失败任务会保留错误信息，可通过 `POST /v1/admin/jobs/{job_id}/retry` 创建新任务。
 同一文档同时只允许一个 pending/running 任务。
+
+## 检索索引初始化
+
+服务启动时调用 Qdrant 索引 bootstrap：collection 不存在则按当前 Embedding
+维度创建，随后补齐 ACL 过滤字段和 BM25 文本索引。`GET /ready` 会验证索引
+状态，未就绪时返回 503，避免 `hybrid_graph` 在无提示的情况下退化为 dense，
+或 ACL 过滤缺少索引。关闭自动 bootstrap 时，应由外部发布流程先完成建库。

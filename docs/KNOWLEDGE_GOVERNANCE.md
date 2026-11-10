@@ -185,5 +185,9 @@ Browser
 已实现：ACL 关系清单、知识管理写接口、审计日志、入库控制台、质量指纹跳过、
 质量状态重建、固定问题集评测、CrossEncoder 重排和父块上下文扩展。
 
-当前后台任务使用 FastAPI BackgroundTasks + SQLite 任务表，适合单实例部署。
-多实例生产部署应替换为 Redis/RQ、Celery 或云队列，并增加任务租约和心跳。
+当前后台任务使用 SQLite 任务表 + 原子领取/租约/心跳，支持进程重启恢复和
+共享同一治理库的多实例 worker。所有实例必须使用同一个 `RAG_GOVERNANCE_DB_PATH`
+存储卷；大规模或跨地域部署仍建议替换为 Redis/RQ、Celery 或云队列。
+
+服务启动时自动创建缺失的 Qdrant collection，并补齐 ACL payload 和 BM25 文本
+索引；`GET /ready` 在索引或 worker 未就绪时返回 503。

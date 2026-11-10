@@ -24,6 +24,10 @@ class IngestionJob:
     message: str = ""
     error: str = ""
     result: dict[str, Any] = field(default_factory=dict)
+    attempt_count: int = 0
+    worker_id: str = ""
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -32,6 +36,8 @@ class IngestionJob:
         if self.status not in _JOB_STATUSES:
             raise ValueError("job.status 必须是 pending/running/succeeded/failed")
         self.progress = max(0, min(100, int(self.progress)))
+        self.attempt_count = max(0, int(self.attempt_count))
+        self.worker_id = str(self.worker_id or "").strip()
         self.result = dict(self.result)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +50,10 @@ class IngestionJob:
             "message": self.message,
             "error": self.error,
             "result": dict(self.result),
+            "attempt_count": self.attempt_count,
+            "worker_id": self.worker_id,
+            "lease_expires_at": self.lease_expires_at,
+            "heartbeat_at": self.heartbeat_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

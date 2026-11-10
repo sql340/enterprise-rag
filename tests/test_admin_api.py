@@ -194,6 +194,16 @@ class AdminApiTest(unittest.TestCase):
         self.assertIn("Atlas Knowledge", page.text)
         self.assertEqual(script.status_code, 200)
 
+    def test_readiness_reports_running_worker(self) -> None:
+        with self._client() as client:
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "ready")
+        self.assertTrue(body["ingestion_worker"]["enabled"])
+        self.assertTrue(body["ingestion_worker"]["running"])
+
 
 if __name__ == "__main__":
     unittest.main()

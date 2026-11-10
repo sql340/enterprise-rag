@@ -83,6 +83,8 @@ class RagSettings:
     qdrant_collection: str = "enterprise_knowledge_bge_m3"
     qdrant_text_index_field: str = "content"
     qdrant_enable_text_index: bool = True
+    qdrant_create_payload_indexes: bool = True
+    rag_bootstrap_search_indexes: bool = True
 
     embedding_provider: str = "sentence_transformers"
     embedding_model: str = "BAAI/bge-m3"
@@ -122,6 +124,10 @@ class RagSettings:
     rag_governance_db_path: str = ".cache/knowledge_governance.sqlite3"
     rag_upload_dir: str = ".cache/knowledge_uploads"
     rag_admin_max_file_bytes: int = 50 * 1024 * 1024
+    rag_ingestion_worker_enabled: bool = True
+    rag_ingestion_poll_seconds: float = 1.0
+    rag_ingestion_lease_seconds: int = 1800
+    rag_ingestion_max_attempts: int = 3
 
     rag_rerank_enabled: bool = False
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3"
@@ -217,6 +223,12 @@ class RagSettings:
             raise ValueError("RAG_UPLOAD_DIR 不能为空")
         if self.rag_admin_max_file_bytes <= 0:
             raise ValueError("RAG_ADMIN_MAX_FILE_BYTES 必须为正整数")
+        if self.rag_ingestion_poll_seconds <= 0:
+            raise ValueError("RAG_INGESTION_POLL_SECONDS 必须为正数")
+        if self.rag_ingestion_lease_seconds <= 0:
+            raise ValueError("RAG_INGESTION_LEASE_SECONDS 必须为正整数")
+        if self.rag_ingestion_max_attempts <= 0:
+            raise ValueError("RAG_INGESTION_MAX_ATTEMPTS 必须为正整数")
         if not self.rag_rerank_model.strip():
             raise ValueError("RAG_RERANK_MODEL 不能为空")
         if self.rag_rerank_candidates <= 0:
@@ -232,6 +244,12 @@ class RagSettings:
             ),
             qdrant_text_index_field=_env("QDRANT_TEXT_INDEX_FIELD", "content"),
             qdrant_enable_text_index=_env_bool("QDRANT_ENABLE_TEXT_INDEX", True),
+            qdrant_create_payload_indexes=_env_bool(
+                "QDRANT_CREATE_PAYLOAD_INDEXES", True
+            ),
+            rag_bootstrap_search_indexes=_env_bool(
+                "RAG_BOOTSTRAP_SEARCH_INDEXES", True
+            ),
             embedding_provider=_env(
                 "EMBEDDING_PROVIDER", "sentence_transformers"
             ),
@@ -276,6 +294,18 @@ class RagSettings:
             rag_upload_dir=_env("RAG_UPLOAD_DIR", ".cache/knowledge_uploads"),
             rag_admin_max_file_bytes=_env_int(
                 "RAG_ADMIN_MAX_FILE_BYTES", 50 * 1024 * 1024
+            ),
+            rag_ingestion_worker_enabled=_env_bool(
+                "RAG_INGESTION_WORKER_ENABLED", True
+            ),
+            rag_ingestion_poll_seconds=_env_float(
+                "RAG_INGESTION_POLL_SECONDS", 1.0
+            ),
+            rag_ingestion_lease_seconds=_env_int(
+                "RAG_INGESTION_LEASE_SECONDS", 1800
+            ),
+            rag_ingestion_max_attempts=_env_int(
+                "RAG_INGESTION_MAX_ATTEMPTS", 3
             ),
             rag_rerank_enabled=_env_bool("RAG_RERANK_ENABLED", False),
             rag_rerank_model=_env(
