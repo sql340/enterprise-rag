@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -25,6 +27,7 @@ from graph_rag import (
     SqliteGraphStore,
 )
 from knowledge_management import (
+    IngestionJobWorker,
     KnowledgeAdminService,
     KnowledgeGovernanceStore,
     KnowledgeIngestionService,
@@ -42,18 +45,14 @@ from .routes.health import router as health_router
 from .routes.query import router as query_router
 
 
+logger = logging.getLogger(__name__)
+
+
 def build_query_service(settings: RagSettings) -> RagQueryService:
     """根据环境配置组装在线查询服务。"""
 
     embedding = _build_embedding(settings)
-    vector_store = QdrantVectorStore(
-        collection_name=settings.qdrant_collection,
-        url=settings.qdrant_url,
-        api_key=settings.qdrant_api_key,
-        create_payload_indexes=False,
-        text_index_field=settings.qdrant_text_index_field,
-        enable_text_index=settings.qdrant_enable_text_index,
-    )
+    vector_store = _build_vector_store(settings)
     llm = OpenAICompatibleLLM(
         model_name=settings.llm_model,
         base_url=settings.llm_base_url,
@@ -112,14 +111,7 @@ def build_admin_service(
     if embedding is None:
         embedding = _build_embedding(settings)
     if vector_store is None:
-        vector_store = QdrantVectorStore(
-            collection_name=settings.qdrant_collection,
-            url=settings.qdrant_url,
-            api_key=settings.qdrant_api_key,
-            create_payload_indexes=False,
-            text_index_field=settings.qdrant_text_index_field,
-            enable_text_index=settings.qdrant_enable_text_index,
-        )
+        vector_store = _build_vector_store(settings)
 
     graph_indexer = None
     if settings.rag_graph_enabled:
@@ -141,6 +133,17 @@ def build_admin_service(
         max_file_bytes=settings.rag_admin_max_file_bytes,
     )
     return KnowledgeAdminService(ingestion)
+
+
+def _build_vector_store(settings: RagSettings) -> QdrantVectorStore:
+    return QdrantVectorStore(
+        collection_name=settings.qdrant_collection,
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key,
+        create_payload_indexes=settings.qdrant_create_payload_indexes,
+        text_index_field=settings.qdrant_text_index_field,
+        enable_text_index=settings.qdrant_enable_text_index,
+    )
 
 
 def _build_embedding(settings: RagSettings) -> BaseEmbedding:
@@ -171,6 +174,7 @@ def create_app(
     service: RagQueryService | None = None,
     admin_service: KnowledgeAdminService | None = None,
     settings: RagSettings | None = None,
+    job_worker_enabled: bool | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用；测试时可直接注入查询服务。"""
 
@@ -179,11 +183,43 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime = service or build_query_service(resolved_settings)
+        resolved_admin = admin_service
+        app.state.admin_service_error = None
+        worker_enabled = (
+            resolved_settings.rag_ingestion_worker_enabled
+            if job_worker_enabled is None
+            else job_worker_enabled
+        )
+        if resolved_admin is None and worker_enabled:
+            try:
+                resolved_admin = await asyncio.to_thread(
+                    build_admin_service, resolved_settings, runtime
+                )
+            except Exception as exc:
+                logger.exception("知识管理服务启动初始化失败")
+                app.state.admin_service_error = exc
         app.state.settings = resolved_settings
         app.state.query_service = runtime
+        app.state.admin_service = resolved_admin
+        app.state.admin_owned = admin_service is None and resolved_admin is not None
+        app.state.ingestion_worker_enabled = worker_enabled
+        app.state.job_worker = None
+        await _bootstrap_search_indexes(runtime, app, resolved_settings)
+        worker: IngestionJobWorker | None = None
+        if worker_enabled and resolved_admin is not None:
+            worker = IngestionJobWorker(
+                resolved_admin.ingestion,
+                poll_seconds=resolved_settings.rag_ingestion_poll_seconds,
+                lease_seconds=resolved_settings.rag_ingestion_lease_seconds,
+                max_attempts=resolved_settings.rag_ingestion_max_attempts,
+            )
+            app.state.job_worker = worker
+            worker.start()
         try:
             yield
         finally:
+            if worker is not None:
+                worker.stop()
             owned_admin = getattr(app.state, "admin_owned", False)
             runtime_admin = getattr(app.state, "admin_service", None)
             if owned_admin and runtime_admin is not None:
@@ -201,6 +237,12 @@ def create_app(
     )
     app.state.admin_service = admin_service
     app.state.admin_owned = admin_service is None
+    app.state.job_worker = None
+    app.state.ingestion_worker_enabled = resolved_settings.rag_ingestion_worker_enabled
+    app.state.search_index_status = {
+        "ready": False,
+        "error": "not_initialized",
+    }
     app.state.admin_service_factory = lambda: build_admin_service(
         resolved_settings,
         getattr(app.state, "query_service", None),
@@ -227,6 +269,64 @@ def create_app(
             return FileResponse(ui_dir / "index.html")
 
     return app
+
+
+async def _bootstrap_search_indexes(
+    runtime: RagQueryService,
+    app: FastAPI,
+    settings: RagSettings,
+) -> None:
+    vector_store = getattr(getattr(runtime, "retriever", None), "vector_store", None)
+    ensure = getattr(vector_store, "ensure_search_indexes", None)
+    status_check = getattr(vector_store, "search_index_status", None)
+    if ensure is None and status_check is None:
+        app.state.search_index_status = {
+            "ready": True,
+            "skipped": True,
+            "reason": "vector_store_not_configured",
+        }
+        return
+
+    def bootstrap() -> dict:
+        status = status_check() if callable(status_check) else None
+        if (
+            status is not None
+            and not status.get("collection_exists")
+            and settings.rag_bootstrap_search_indexes
+        ):
+            embedding = getattr(
+                getattr(runtime, "retriever", None),
+                "embedding",
+                None,
+            )
+            if embedding is None:
+                raise RuntimeError("无法初始化 Qdrant collection：Embedding 未配置")
+            dimension = int(embedding.dimension)
+            if dimension <= 0:
+                raise RuntimeError("无法初始化 Qdrant collection：向量维度无效")
+            vector_store.ensure_collection(dimension)
+
+        if callable(ensure):
+            return ensure()
+        if callable(status_check):
+            return status_check()
+        return status or {"ready": False, "error": "search_index_status_missing"}
+
+    try:
+        status = await asyncio.to_thread(bootstrap)
+        app.state.search_index_status = status
+        if not status.get("collection_exists"):
+            logger.warning("Qdrant collection 尚未创建，检索索引未就绪: %s", status)
+        elif not status.get("ready"):
+            logger.warning("Qdrant 检索索引未就绪: %s", status)
+    except Exception as exc:
+        logger.exception("Qdrant 检索索引初始化失败")
+        app.state.search_index_status = {
+            "ready": False,
+            "collection_exists": False,
+            "error": "bootstrap_failed",
+            "detail": str(exc)[:500],
+        }
 
 
 def _close_admin_service(service: KnowledgeAdminService) -> None:

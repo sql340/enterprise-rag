@@ -230,42 +230,98 @@ class QdrantVectorStore(BaseVectorStore):
         size = getattr(vectors, "size", None)
         return int(size) if size is not None else None
 
+    def ensure_search_indexes(self) -> dict[str, Any]:
+        """补齐已有 collection 的 payload/文本索引，并返回当前索引状态。"""
+
+        if not self.client.collection_exists(self.collection_name):
+            return {
+                "ready": False,
+                "collection_exists": False,
+                "missing_payload_indexes": list(self.payload_index_fields),
+                "text_index": False,
+            }
+        self._ensure_payload_indexes()
+        return self.search_index_status()
+
+    def search_index_status(self) -> dict[str, Any]:
+        """检查 ACL 过滤和 BM25 所需索引是否已创建。"""
+
+        if not self.client.collection_exists(self.collection_name):
+            self._text_index_available = False
+            return {
+                "ready": False,
+                "collection_exists": False,
+                "missing_payload_indexes": list(self.payload_index_fields),
+                "text_index": False,
+            }
+
+        info = self.client.get_collection(self.collection_name)
+        payload_schema = dict(getattr(info, "payload_schema", None) or {})
+        present_fields = {str(field) for field in payload_schema}
+        missing_payload_indexes = sorted(
+            set(self.payload_index_fields) - present_fields
+        )
+        text_index = self.text_index_field in present_fields
+        if self.enable_text_index and not text_index:
+            self._text_index_available = False
+        elif text_index:
+            self._text_index_available = True
+        ready = not missing_payload_indexes and (
+            not self.enable_text_index or text_index
+        )
+        if self.create_payload_indexes:
+            self._payload_indexes_ready = ready
+        return {
+            "ready": ready,
+            "collection_exists": True,
+            "missing_payload_indexes": missing_payload_indexes,
+            "text_index": text_index,
+            "payload_indexes": sorted(present_fields),
+        }
+
     def _ensure_payload_indexes(self) -> None:
         if self._payload_indexes_ready or not self.create_payload_indexes:
             return
-        for field_name in self.payload_index_fields:
-            index_type = self.PAYLOAD_INDEX_TYPES.get(field_name, "keyword")
-            field_schema = (
-                models.PayloadSchemaType.INTEGER
-                if index_type == "integer"
-                else models.PayloadSchemaType.KEYWORD
-            )
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name=field_name,
-                field_schema=field_schema,
-                wait=True,
-            )
-        if self.enable_text_index:
-            try:
+        indexes_ready = True
+        try:
+            for field_name in self.payload_index_fields:
+                index_type = self.PAYLOAD_INDEX_TYPES.get(field_name, "keyword")
+                field_schema = (
+                    models.PayloadSchemaType.INTEGER
+                    if index_type == "integer"
+                    else models.PayloadSchemaType.KEYWORD
+                )
                 self.client.create_payload_index(
                     collection_name=self.collection_name,
-                    field_name=self.text_index_field,
-                    field_schema=models.TextIndexParams(
-                        type=models.TextIndexType.TEXT,
-                        tokenizer=models.TokenizerType.MULTILINGUAL,
-                        lowercase=True,
-                        scoring=True,
-                    ),
+                    field_name=field_name,
+                    field_schema=field_schema,
                     wait=True,
                 )
-            except Exception as exc:
-                self._text_index_available = False
-                logger.warning(
-                    "创建 Qdrant BM25 文本索引失败，hybrid 将回退 dense: %s",
-                    exc,
-                )
-        self._payload_indexes_ready = True
+            if self.enable_text_index:
+                try:
+                    self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=self.text_index_field,
+                        field_schema=models.TextIndexParams(
+                            type=models.TextIndexType.TEXT,
+                            tokenizer=models.TokenizerType.MULTILINGUAL,
+                            lowercase=True,
+                            scoring=True,
+                        ),
+                        wait=True,
+                    )
+                except Exception as exc:
+                    indexes_ready = False
+                    self._text_index_available = False
+                    logger.warning(
+                        "创建 Qdrant BM25 文本索引失败，hybrid 将回退 dense: %s",
+                        exc,
+                    )
+        except Exception:
+            indexes_ready = False
+            raise
+        finally:
+            self._payload_indexes_ready = indexes_ready
 
     def upsert_chunks(
         self,

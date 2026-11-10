@@ -5,7 +5,7 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from access_control import AccessControlError, Principal
 from api.AdminAccessController import AdminAccessController
@@ -69,6 +69,13 @@ def _principal(request: Request) -> Principal:
     if not principal.is_admin:
         raise HTTPException(status_code=403, detail="需要知识管理员角色")
     return principal
+
+
+def _notify_job_worker(request: Request) -> None:
+    worker = getattr(request.app.state, "job_worker", None)
+    notify = getattr(worker, "notify", None)
+    if callable(notify):
+        notify()
 
 
 @router.get("/capabilities", summary="管理端能力与支持文件类型")
@@ -162,7 +169,6 @@ async def list_documents(
 async def rebuild_by_quality(
     payload: AdminRebuildRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     principal = _principal(request)
     service = await _admin_service(request)
@@ -174,8 +180,8 @@ async def rebuild_by_quality(
         )
     except Exception as exc:
         raise _to_http_error(exc) from exc
-    for job in jobs:
-        background_tasks.add_task(service.ingestion.run_job, job.job_id)
+    if jobs:
+        _notify_job_worker(request)
     return {"jobs": [job.to_dict() for job in jobs], "skipped": skipped}
 
 
@@ -295,7 +301,6 @@ async def create_job(
     payload: AdminJobRequest,
     request: Request,
     document_id: str,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     principal = _principal(request)
     service = await _admin_service(request)
@@ -309,7 +314,7 @@ async def create_job(
     except Exception as exc:
         raise _to_http_error(exc) from exc
     if job.status == "pending":
-        background_tasks.add_task(service.ingestion.run_job, job.job_id)
+        _notify_job_worker(request)
     return job.to_dict()
 
 
@@ -352,7 +357,6 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
 async def retry_job(
     request: Request,
     job_id: str,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     principal = _principal(request)
     service = await _admin_service(request)
@@ -365,7 +369,7 @@ async def retry_job(
     except Exception as exc:
         raise _to_http_error(exc) from exc
     if job.status == "pending":
-        background_tasks.add_task(service.ingestion.run_job, job.job_id)
+        _notify_job_worker(request)
     return job.to_dict()
 
 

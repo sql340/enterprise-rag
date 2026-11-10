@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,10 @@ class KnowledgeGovernanceStore:
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 30000")
+        if self.path != ":memory:":
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = NORMAL")
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -65,6 +70,10 @@ class KnowledgeGovernanceStore:
                     message TEXT NOT NULL,
                     error TEXT NOT NULL,
                     result_json TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT,
+                    heartbeat_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (document_id) REFERENCES knowledge_documents(document_id)
@@ -95,6 +104,14 @@ class KnowledgeGovernanceStore:
                 "build_fingerprint",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            self._ensure_column(
+                "knowledge_jobs", "attempt_count", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                "knowledge_jobs", "worker_id", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column("knowledge_jobs", "lease_expires_at", "TEXT")
+            self._ensure_column("knowledge_jobs", "heartbeat_at", "TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {
@@ -229,8 +246,9 @@ class KnowledgeGovernanceStore:
                 """
                 INSERT INTO knowledge_jobs (
                     job_id, tenant_id, document_id, status, progress,
-                    message, error, result_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    message, error, result_json, attempt_count, worker_id,
+                    lease_expires_at, heartbeat_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -241,6 +259,10 @@ class KnowledgeGovernanceStore:
                     job.message,
                     job.error,
                     _json(job.result),
+                    job.attempt_count,
+                    job.worker_id,
+                    job.lease_expires_at,
+                    job.heartbeat_at,
                     job.created_at,
                     job.updated_at,
                 ),
@@ -260,7 +282,8 @@ class KnowledgeGovernanceStore:
                 """
                 UPDATE knowledge_jobs SET
                     status = ?, progress = ?, message = ?, error = ?,
-                    result_json = ?, updated_at = ?
+                    result_json = ?, attempt_count = ?, worker_id = ?,
+                    lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
                 WHERE job_id = ? AND tenant_id = ?
                 """,
                 (
@@ -269,11 +292,143 @@ class KnowledgeGovernanceStore:
                     job.message,
                     job.error,
                     _json(job.result),
+                    job.attempt_count,
+                    job.worker_id,
+                    job.lease_expires_at,
+                    job.heartbeat_at,
                     job.updated_at,
                     job.job_id,
                     job.tenant_id,
                 ),
             )
+
+    def claim_next_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        max_attempts: int,
+    ) -> IngestionJob | None:
+        """原子领取一个待执行任务或租约已过期的任务。"""
+
+        worker = str(worker_id).strip()
+        if not worker:
+            raise ValueError("worker_id 不能为空")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds 必须为正整数")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts 必须为正整数")
+
+        now = datetime.now(timezone.utc)
+        now_value = now.isoformat()
+        lease_value = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock:
+            connection = self._connection
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                exhausted = connection.execute(
+                    """
+                    SELECT job_id, document_id FROM knowledge_jobs
+                    WHERE status = 'running'
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                      AND attempt_count >= ?
+                    """,
+                    (now_value, max_attempts),
+                ).fetchall()
+                for row in exhausted:
+                    connection.execute(
+                        """
+                        UPDATE knowledge_documents
+                        SET status = 'failed', updated_at = ?
+                        WHERE document_id = ?
+                        """,
+                        (now_value, row["document_id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE knowledge_jobs
+                        SET status = 'failed', progress = 100,
+                            message = 'failed', error = ?,
+                            lease_expires_at = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (
+                            "任务租约过期且已达到最大重试次数",
+                            now_value,
+                            row["job_id"],
+                        ),
+                    )
+
+                row = connection.execute(
+                    """
+                    SELECT * FROM knowledge_jobs
+                    WHERE status = 'pending'
+                       OR (
+                           status = 'running'
+                           AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                       )
+                    ORDER BY created_at, job_id
+                    LIMIT 1
+                    """,
+                    (now_value,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+
+                connection.execute(
+                    """
+                    UPDATE knowledge_jobs
+                    SET status = 'running', progress = 5, message = 'claimed',
+                        error = '', worker_id = ?, lease_expires_at = ?,
+                        heartbeat_at = ?, attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        worker,
+                        lease_value,
+                        now_value,
+                        now_value,
+                        row["job_id"],
+                    ),
+                )
+                claimed = connection.execute(
+                    "SELECT * FROM knowledge_jobs WHERE job_id = ?",
+                    (row["job_id"],),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return _row_to_job(claimed) if claimed else None
+
+    def heartbeat_job(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        """续租；任务已被其它 worker 接管时返回 False。"""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds 必须为正整数")
+        now = datetime.now(timezone.utc)
+        now_value = now.isoformat()
+        lease_value = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE knowledge_jobs
+                SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE job_id = ? AND worker_id = ? AND status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (lease_value, now_value, now_value, job_id, worker_id, now_value),
+            )
+        return cursor.rowcount == 1
 
     def get_job(
         self,
@@ -414,6 +569,12 @@ def _row_to_job(row: sqlite3.Row) -> IngestionJob:
         message=str(row["message"]),
         error=str(row["error"]),
         result=dict(_load_json(row["result_json"]) or {}),
+        attempt_count=int(row["attempt_count"]),
+        worker_id=str(row["worker_id"]),
+        lease_expires_at=(
+            str(row["lease_expires_at"]) if row["lease_expires_at"] else None
+        ),
+        heartbeat_at=str(row["heartbeat_at"]) if row["heartbeat_at"] else None,
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )

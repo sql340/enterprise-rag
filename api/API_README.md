@@ -24,7 +24,8 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 
 - API：`http://localhost:8080`
 - OpenAPI：`http://localhost:8080/docs`
-- 健康检查：`GET /health`
+- 存活检查：`GET /health`
+- 就绪检查：`GET /ready`（索引或 worker 未就绪时返回 503）
 - 流式问答：`POST /v1/query`
 - 知识控制台：`GET /admin`
 
@@ -33,6 +34,8 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 ```bash
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=enterprise_knowledge_bge_m3
+QDRANT_CREATE_PAYLOAD_INDEXES=true
+RAG_BOOTSTRAP_SEARCH_INDEXES=true
 EMBEDDING_MODEL=BAAI/bge-m3
 
 LLM_BASE_URL=http://localhost:8000/v1
@@ -49,11 +52,29 @@ RAG_GRAPH_ENABLED=true
 RAG_GRAPH_STORE_PATH=.cache/knowledge_graph.sqlite3
 RAG_GRAPH_WEIGHT=0.8
 RAG_GRAPH_MAX_HOPS=1
+
+# 持久化构建 worker；多实例必须共享 RAG_GOVERNANCE_DB_PATH
+RAG_INGESTION_WORKER_ENABLED=true
+RAG_INGESTION_LEASE_SECONDS=1800
+RAG_INGESTION_MAX_ATTEMPTS=3
 ```
 
 Embedding 和 LLM 都支持 OpenAI 兼容服务。如果 Embedding 使用企业网关，
 设置 `EMBEDDING_PROVIDER=openai_compatible`、`EMBEDDING_API_BASE_URL` 和
-`EMBEDDING_DIMENSION`。
+`EMBEDDING_DIMENSION`。使用 API Embedding 时必须显式配置维度，服务才能在
+collection 不存在时自动创建向量集合。
+
+## 启动初始化与就绪检查
+
+服务启动时会检查 Qdrant collection。collection 不存在时，按当前 Embedding
+维度自动创建，并补齐 ACL 过滤字段和 BM25 文本索引；已有 collection 也会补齐
+缺失索引。`QDRANT_CREATE_PAYLOAD_INDEXES=false` 或
+`RAG_BOOTSTRAP_SEARCH_INDEXES=false` 可关闭自动初始化，但此时必须由外部流程
+先完成建库建索引，否则 `/ready` 会持续返回 503。
+
+`/health` 只用于判断进程存活，不访问 Qdrant。`/ready` 会实时检查检索索引，
+并确认配置启用时构建 worker 与管理服务已经正常运行。负载均衡、Kubernetes
+readiness probe 和发布脚本应使用 `/ready`，避免在索引未完成时接流量。
 
 ## 流式查询
 
@@ -254,7 +275,7 @@ api/
 ├── QueryRequest.py           # 请求模型
 ├── sse.py                    # SSE 编码
 └── routes/
-    ├── health.py             # 健康检查
+    ├── health.py             # 存活与就绪检查
     └── query.py              # 流式查询路由
 access_control/
 ├── Classification.py         # 文档密级
@@ -299,6 +320,10 @@ evaluation/
 - 使用本地 bge-m3 和 GPU 时，每个 uvicorn worker 都会加载一份模型；按显存
   控制 worker 数量。Embedding 也可切换到独立的企业 OpenAI 兼容服务。
 - SentenceTransformer 首次查询会加载模型；生产环境建议预热模型缓存。
+- 多实例部署时，所有实例必须挂载同一个 `RAG_GOVERNANCE_DB_PATH` 和上传目录；
+  SQLite 原子领取与租约支持多 worker 协作，但不适合跨地域高延迟存储。
+- 新实例启动时可通过 `/ready` 作为发布门禁；若 Qdrant 暂时不可用，服务会保持
+  未就绪而不是带病接流量。
 - `API_CORS_ORIGINS` 为空时不启用 CORS。多个来源用逗号分隔，禁止长期使用
   `*` 开放生产接口。
 - 当前只提供单轮问答。多轮会话可后续在 `PromptBuilder` 和请求模型中增加

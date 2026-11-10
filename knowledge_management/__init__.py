@@ -3,6 +3,8 @@
 from .AuditEvent import AuditEvent
 from .ChunkQualityAnalyzer import ChunkQualityAnalyzer
 from .IngestionJob import IngestionJob
+from .IngestionJobLeaseError import IngestionJobLeaseError
+from .IngestionJobWorker import IngestionJobWorker
 from .KnowledgeBuildFingerprint import KnowledgeBuildFingerprint
 from .KnowledgeAdminService import KnowledgeAdminService
 from .KnowledgeDocument import KnowledgeDocument
@@ -13,6 +15,8 @@ __all__ = [
     "AuditEvent",
     "ChunkQualityAnalyzer",
     "IngestionJob",
+    "IngestionJobLeaseError",
+    "IngestionJobWorker",
     "KnowledgeBuildFingerprint",
     "KnowledgeAdminService",
     "KnowledgeDocument",

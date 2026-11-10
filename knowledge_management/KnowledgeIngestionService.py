@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +19,13 @@ from graph_rag import GraphIndexer
 from .AuditEvent import AuditEvent
 from .ChunkQualityAnalyzer import ChunkQualityAnalyzer
 from .IngestionJob import IngestionJob
+from .IngestionJobLeaseError import IngestionJobLeaseError
 from .KnowledgeBuildFingerprint import KnowledgeBuildFingerprint
 from .KnowledgeDocument import KnowledgeDocument
 from .KnowledgeGovernanceStore import KnowledgeGovernanceStore
+
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeIngestionService:
@@ -263,31 +268,48 @@ class KnowledgeIngestionService:
             force_reindex=True,
         )
 
-    def run_job(self, job_id: str) -> IngestionJob:
+    def run_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None = None,
+        lease_seconds: int = 1800,
+    ) -> IngestionJob:
         job = self.governance_store.get_job_internal(job_id)
         if job is None:
             raise ValueError("任务不存在")
-        if job.status in {"succeeded", "running"}:
+        if job.status == "succeeded":
             return job
-        document = self._require_document(job.tenant_id, job.document_id)
-        job.status = "running"
-        job.progress = 5
-        job.message = "started"
-        job.updated_at = _now()
-        self.governance_store.save_job(job)
-        document.status = "running"
-        self.governance_store.save_document(document)
+        if job.status == "running" and (
+            not worker_id or job.worker_id != worker_id
+        ):
+            return job
+        if job.status not in {"pending", "running", "failed"}:
+            return job
 
-        force_reindex = bool(job.result.get("force_reindex"))
-        previous_build_fingerprint = str(document.build_fingerprint or "")
-        build_fingerprint = self._build_fingerprint(document)
+        document: KnowledgeDocument | None = None
         try:
+            document = self._require_document(job.tenant_id, job.document_id)
+            self._heartbeat(job, worker_id, lease_seconds)
+            job.status = "running"
+            job.progress = 5
+            job.message = "started"
+            job.updated_at = _now()
+            self.governance_store.save_job(job)
+            document.status = "running"
+            self.governance_store.save_document(document)
+
+            force_reindex = bool(job.result.get("force_reindex"))
+            previous_build_fingerprint = str(document.build_fingerprint or "")
+            build_fingerprint = self._build_fingerprint(document)
             documents = self._read_documents(document)
+            self._heartbeat(job, worker_id, lease_seconds)
             job.progress = 25
             job.message = "parsed"
             self.governance_store.save_job(job)
             chunks = self._chunk_documents(document, documents)
             chunks, quality_report = self.quality_analyzer.analyze(chunks)
+            self._heartbeat(job, worker_id, lease_seconds)
             job.progress = 45
             job.message = "chunked"
             job.result = {**job.result, "quality_report": quality_report}
@@ -311,6 +333,7 @@ class KnowledgeIngestionService:
                 tenant_id=document.tenant_id,
                 force_reindex=force_reindex,
             )
+            self._heartbeat(job, worker_id, lease_seconds)
             job.progress = 75
             job.message = "vectorized"
             self.governance_store.save_job(job)
@@ -328,6 +351,7 @@ class KnowledgeIngestionService:
                     new_document_ids=vector_result.document_ids,
                 )
                 graph_result = indexed.to_dict()
+            self._heartbeat(job, worker_id, lease_seconds)
             job.progress = 95
             job.message = "indexed"
             self.governance_store.save_job(job)
@@ -347,10 +371,13 @@ class KnowledgeIngestionService:
                 document.quality_status = "unreviewed"
                 document.quality_note = "文档内容或构建配置已变更，请复核质量"
             self.governance_store.save_document(document)
+            self._heartbeat(job, worker_id, lease_seconds)
             job.status = "succeeded"
             job.progress = 100
             job.message = "completed"
             job.error = ""
+            job.lease_expires_at = None
+            job.heartbeat_at = _now()
             job.result = {
                 "vector": vector_result.to_dict(),
                 "graph": graph_result,
@@ -370,13 +397,25 @@ class KnowledgeIngestionService:
                 {"document_id": document.document_id, "chunks": len(scoped_chunks)},
             )
             return job
+        except IngestionJobLeaseError:
+            logger.warning("任务租约已失效，停止写入: %s", job.job_id)
+            return job
         except Exception as exc:
-            document.status = "failed"
-            self.governance_store.save_document(document)
+            if worker_id is not None:
+                try:
+                    self._heartbeat(job, worker_id, lease_seconds)
+                except IngestionJobLeaseError:
+                    logger.warning("任务租约已失效，停止写入失败状态: %s", job.job_id)
+                    return job
+            if document is not None:
+                document.status = "failed"
+                self.governance_store.save_document(document)
             job.status = "failed"
             job.progress = 100
             job.message = "failed"
             job.error = str(exc)
+            job.lease_expires_at = None
+            job.heartbeat_at = _now()
             job.updated_at = _now()
             self.governance_store.save_job(job)
             self._audit(
@@ -385,9 +424,29 @@ class KnowledgeIngestionService:
                 "ingestion_job.fail",
                 "job",
                 job.job_id,
-                {"document_id": document.document_id, "error": str(exc)},
+                {"document_id": job.document_id, "error": str(exc)},
             )
             raise
+
+    def _heartbeat(
+        self,
+        job: IngestionJob,
+        worker_id: str | None,
+        lease_seconds: int,
+    ) -> None:
+        if not worker_id:
+            return
+        if not self.governance_store.heartbeat_job(
+            job_id=job.job_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        ):
+            raise IngestionJobLeaseError(f"任务 {job.job_id} 的租约已失效")
+        now = datetime.now(timezone.utc)
+        job.heartbeat_at = now.isoformat()
+        job.lease_expires_at = (
+            now + timedelta(seconds=lease_seconds)
+        ).isoformat()
 
     def update_acl(
         self,
