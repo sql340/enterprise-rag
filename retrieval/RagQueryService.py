@@ -7,6 +7,7 @@ from typing import Any
 
 from access_control import Principal
 from generation import BaseLLM
+from observability import RagMetrics
 
 from .KnowledgeRetriever import KnowledgeRetriever
 from .PromptBuilder import PromptBuilder
@@ -28,6 +29,7 @@ class RagQueryService:
         default_temperature: float = 0.2,
         default_max_tokens: int | None = 1024,
         no_context_answer: str = "未在知识库中检索到相关内容，无法回答该问题。",
+        metrics: RagMetrics | None = None,
     ) -> None:
         if default_top_k <= 0:
             raise ValueError("default_top_k 必须为正整数")
@@ -48,6 +50,7 @@ class RagQueryService:
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.no_context_answer = no_context_answer
+        self.metrics = metrics
 
     async def stream(
         self,
@@ -126,13 +129,36 @@ class RagQueryService:
             return
 
         messages = self.prompt_builder.build(question, sources)
-        async for content in self.llm.stream_chat(
-            messages,
-            temperature=resolved_temperature,
-            max_tokens=resolved_max_tokens,
-        ):
-            if content:
-                yield RagStreamEvent("delta", {"content": content})
+        llm_started_at = perf_counter()
+        first_token_seconds: float | None = None
+        llm_outcome = "success"
+        try:
+            async for content in self.llm.stream_chat(
+                messages,
+                temperature=resolved_temperature,
+                max_tokens=resolved_max_tokens,
+            ):
+                if content:
+                    if first_token_seconds is None:
+                        first_token_seconds = perf_counter() - llm_started_at
+                    yield RagStreamEvent("delta", {"content": content})
+        except asyncio.CancelledError:
+            llm_outcome = "cancelled"
+            raise
+        except GeneratorExit:
+            llm_outcome = "cancelled"
+            raise
+        except Exception:
+            llm_outcome = "error"
+            raise
+        finally:
+            if self.metrics is not None:
+                self.metrics.observe_llm_stream(
+                    model=str(getattr(self.llm, "model_name", "unknown")),
+                    outcome=llm_outcome,
+                    duration_seconds=perf_counter() - llm_started_at,
+                    ttft_seconds=first_token_seconds,
+                )
 
         yield RagStreamEvent(
             "done",

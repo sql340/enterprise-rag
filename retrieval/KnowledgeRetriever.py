@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from time import perf_counter
 from typing import Any
 
 from access_control import AccessControlError, Principal, QdrantAclFilter
 from data_processing.knowledge_indexing import BaseEmbedding
 from graph_rag import GraphRetriever, GraphSearchHit
+from observability import RagMetrics
 
 from .RrfFusion import RrfFusion
 from .rerank import BaseReranker
@@ -36,6 +38,7 @@ class KnowledgeRetriever:
         reranker: BaseReranker | None = None,
         rerank_candidates: int = 0,
         expand_parent_context: bool = False,
+        metrics: RagMetrics | None = None,
     ) -> None:
         if candidate_multiplier <= 0:
             raise ValueError("candidate_multiplier 必须为正整数")
@@ -60,6 +63,7 @@ class KnowledgeRetriever:
         self.reranker = reranker
         self.rerank_candidates = rerank_candidates
         self.expand_parent_context = expand_parent_context
+        self.metrics = metrics
 
     def retrieve(
         self,
@@ -81,92 +85,166 @@ class KnowledgeRetriever:
             if retrieval_mode is None
             else _normalise_mode(retrieval_mode)
         )
-        effective_filters = self._effective_filters(filters, principal)
-        if mode == "graph":
-            graph_limit = self._candidate_limit(top_k)
-            return self._finalize(
-                question,
-                self._graph_search(
+        started_at = perf_counter()
+        outcome = "success"
+        result_count = 0
+        try:
+            effective_filters = self._effective_filters(filters, principal)
+            if mode == "graph":
+                graph_limit = self._candidate_limit(top_k)
+                graph_started_at = perf_counter()
+                graph_results = self._graph_search(
                     question,
                     filters=effective_filters,
                     principal=principal,
                     limit=graph_limit,
-                ),
-                top_k=top_k,
-                filters=effective_filters,
-            )
-
-        query_vector = self.embedding.embed_query(question.strip())
-        if mode == "dense":
-            dense_results = self._dense_search(
-                query_vector,
-                limit=self._candidate_limit(top_k),
-                score_threshold=score_threshold,
-                filters=effective_filters,
-                retrieval_mode="dense",
-            )
-            return self._finalize(
-                question,
-                dense_results,
-                top_k=top_k,
-                filters=effective_filters,
-            )
-
-        candidate_limit = min(
-            self.max_candidates,
-            max(top_k, top_k * self.candidate_multiplier),
-        )
-        if self.reranker is not None:
-            candidate_limit = min(
-                self.max_candidates,
-                max(candidate_limit, self._candidate_limit(top_k)),
-            )
-        dense_results = self._dense_search(
-            query_vector,
-            limit=candidate_limit,
-            score_threshold=score_threshold,
-            filters=effective_filters,
-            retrieval_mode="dense",
-        )
-        routes = {"dense": dense_results}
-
-        if self.vector_store.supports_text_search:
-            try:
-                routes["keyword"] = self.vector_store.text_search(
+                )
+                self._observe_route(
+                    "graph",
+                    "success" if graph_results else "empty",
+                    graph_started_at,
+                )
+                results = self._finalize(
                     question,
-                    limit=candidate_limit,
+                    graph_results,
+                    top_k=top_k,
                     filters=effective_filters,
                 )
-            except (NotImplementedError, RuntimeError) as exc:
-                logger.warning("BM25 文本检索不可用，继续使用其它检索路: %s", exc)
+            else:
+                query_vector = self._embed_query(question.strip())
+                if mode == "dense":
+                    dense_results = self._dense_search(
+                        query_vector,
+                        limit=self._candidate_limit(top_k),
+                        score_threshold=score_threshold,
+                        filters=effective_filters,
+                        retrieval_mode="dense",
+                    )
+                    results = self._finalize(
+                        question,
+                        dense_results,
+                        top_k=top_k,
+                        filters=effective_filters,
+                    )
+                else:
+                    candidate_limit = min(
+                        self.max_candidates,
+                        max(top_k, top_k * self.candidate_multiplier),
+                    )
+                    if self.reranker is not None:
+                        candidate_limit = min(
+                            self.max_candidates,
+                            max(candidate_limit, self._candidate_limit(top_k)),
+                        )
+                    dense_results = self._dense_search(
+                        query_vector,
+                        limit=candidate_limit,
+                        score_threshold=score_threshold,
+                        filters=effective_filters,
+                        retrieval_mode="dense",
+                    )
+                    routes = {"dense": dense_results}
 
-        if mode == "hybrid_graph":
-            graph_results = self._graph_search(
-                question,
-                filters=effective_filters,
-                principal=principal,
-                limit=candidate_limit,
-            )
-            if graph_results:
-                routes["graph"] = graph_results
+                    if self.vector_store.supports_text_search:
+                        keyword_started_at = perf_counter()
+                        try:
+                            routes["keyword"] = self.vector_store.text_search(
+                                question,
+                                limit=candidate_limit,
+                                filters=effective_filters,
+                            )
+                        except (NotImplementedError, RuntimeError) as exc:
+                            self._observe_route(
+                                "keyword", "fallback", keyword_started_at
+                            )
+                            self._observe_route_error("keyword", exc)
+                            logger.warning(
+                                "BM25 文本检索不可用，继续使用其它检索路: %s", exc
+                            )
+                        else:
+                            self._observe_route(
+                                "keyword", "success", keyword_started_at
+                            )
 
-        if len(routes) == 1:
-            fused = dense_results
-        else:
-            fused = self.rrf_fusion.fuse(
-                routes,
-                limit=candidate_limit if self.reranker is not None else top_k,
-                weights={
-                    "dense": self.dense_weight,
-                    "keyword": self.keyword_weight,
-                    "graph": self.graph_weight,
-                },
-            )
-        return self._finalize(
-            question,
-            fused,
-            top_k=top_k,
-            filters=effective_filters,
+                    if mode == "hybrid_graph":
+                        graph_started_at = perf_counter()
+                        graph_results = self._graph_search(
+                            question,
+                            filters=effective_filters,
+                            principal=principal,
+                            limit=candidate_limit,
+                        )
+                        self._observe_route(
+                            "graph",
+                            "success" if graph_results else "empty",
+                            graph_started_at,
+                        )
+                        if graph_results:
+                            routes["graph"] = graph_results
+
+                    if len(routes) == 1:
+                        fused = dense_results
+                    else:
+                        fusion_started_at = perf_counter()
+                        fused = self.rrf_fusion.fuse(
+                            routes,
+                            limit=(
+                                candidate_limit
+                                if self.reranker is not None
+                                else top_k
+                            ),
+                            weights={
+                                "dense": self.dense_weight,
+                                "keyword": self.keyword_weight,
+                                "graph": self.graph_weight,
+                            },
+                        )
+                        self._observe_route("fusion", "success", fusion_started_at)
+                    results = self._finalize(
+                        question,
+                        fused,
+                        top_k=top_k,
+                        filters=effective_filters,
+                    )
+
+            result_count = len(results)
+            if not results:
+                outcome = "empty"
+            return results
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            if self.metrics is not None:
+                self.metrics.observe_retrieval(
+                    mode=mode,
+                    outcome=outcome,
+                    duration_seconds=perf_counter() - started_at,
+                    result_count=result_count,
+                )
+
+    def _embed_query(self, question: str) -> list[float]:
+        started_at = perf_counter()
+        try:
+            vector = self.embedding.embed_query(question)
+        except Exception as exc:
+            self._observe_embedding("error", started_at)
+            self._observe_route("embedding", "error", started_at)
+            self._observe_route_error("embedding", exc)
+            raise
+        self._observe_embedding("success", started_at)
+        self._observe_route("embedding", "success", started_at)
+        return vector
+
+    def _observe_embedding(self, outcome: str, started_at: float) -> None:
+        if self.metrics is None:
+            return
+        self.metrics.observe_embedding(
+            model=str(getattr(self.embedding, "model_name", "unknown")),
+            operation="query",
+            outcome=outcome,
+            duration_seconds=perf_counter() - started_at,
+            text_count=1,
         )
 
     def _candidate_limit(self, top_k: int) -> int:
@@ -185,11 +263,16 @@ class KnowledgeRetriever:
     ) -> list[VectorSearchResult]:
         values = list(results)
         if self.reranker is not None:
+            rerank_started_at = perf_counter()
             try:
                 values = self.reranker.rerank(question, values, top_k=top_k)
             except Exception as exc:
+                self._observe_route("rerank", "fallback", rerank_started_at)
+                self._observe_route_error("rerank", exc)
                 logger.warning("重排失败，退回融合排序: %s", exc)
                 values = values[:top_k]
+            else:
+                self._observe_route("rerank", "success", rerank_started_at)
         else:
             values = values[:top_k]
         if self.expand_parent_context:
@@ -216,11 +299,15 @@ class KnowledgeRetriever:
         getter = getattr(self.vector_store, "get_chunks_by_ids", None)
         if getter is None:
             return values
+        parent_started_at = perf_counter()
         try:
             parents = getter(parent_ids, filters=filters)
         except Exception as exc:
+            self._observe_route("parent_expand", "fallback", parent_started_at)
+            self._observe_route_error("parent_expand", exc)
             logger.warning("父块上下文扩展失败，保留原始知识块: %s", exc)
             return values
+        self._observe_route("parent_expand", "success", parent_started_at)
         parents_by_id = {item.chunk_id: item for item in parents}
         for item in values:
             parent_id = str(item.payload.get("parent_id") or "")
@@ -241,12 +328,19 @@ class KnowledgeRetriever:
         filters: Mapping[str, Any] | Any | None,
         retrieval_mode: str,
     ) -> list[VectorSearchResult]:
-        results = self.vector_store.search(
-            query_vector,
-            limit=limit,
-            score_threshold=score_threshold,
-            filters=filters,
-        )
+        started_at = perf_counter()
+        try:
+            results = self.vector_store.search(
+                query_vector,
+                limit=limit,
+                score_threshold=score_threshold,
+                filters=filters,
+            )
+        except Exception as exc:
+            self._observe_route("dense", "error", started_at)
+            self._observe_route_error("dense", exc)
+            raise
+        self._observe_route("dense", "success", started_at)
         for rank, result in enumerate(results, start=1):
             result.retrieval_mode = retrieval_mode
             result.route_scores.setdefault("dense", result.score)
@@ -277,6 +371,7 @@ class KnowledgeRetriever:
                     limit=fetch_limit,
                 )
             except Exception as exc:
+                self._observe_route_error("graph", exc)
                 logger.warning("图谱检索不可用，跳过 graph 路: %s", exc)
                 return []
             if not hits:
@@ -314,6 +409,7 @@ class KnowledgeRetriever:
                 filters=filters,
             )
         except Exception as exc:
+            self._observe_route_error("graph", exc)
             logger.warning("图谱候选正文读取失败，跳过 graph 路: %s", exc)
             return []
         chunks_by_id = {result.chunk_id: result for result in chunks}
@@ -350,6 +446,21 @@ class KnowledgeRetriever:
         if merge_filters is None:
             return tuple(values)
         return merge_filters(*values)
+
+    def _observe_route(self, route: str, outcome: str, started_at: float) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_retrieval_route(
+                route=route,
+                outcome=outcome,
+                duration_seconds=perf_counter() - started_at,
+            )
+
+    def _observe_route_error(self, route: str, exc: Exception) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_retrieval_route_error(
+                route=route,
+                error_type=type(exc).__name__,
+            )
 
     def close(self) -> None:
         try:

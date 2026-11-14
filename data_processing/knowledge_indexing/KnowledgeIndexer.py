@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+from time import perf_counter
 from typing import Any
 
 from access_control import DocumentAcl
 from data_processing.chunker import Chunk, Chunker, DocumentLike, TenantChunkScope
+from observability import RagMetrics
 from retrieval.vector_store import BaseVectorStore
 
 from .BaseEmbedding import BaseEmbedding
@@ -40,6 +42,7 @@ class KnowledgeIndexer:
         delete_stale: bool = True,
         skip_existing: bool = True,
         acl: DocumentAcl | None = None,
+        metrics: RagMetrics | None = None,
     ) -> None:
         if acl is not None and not isinstance(acl, DocumentAcl):
             raise TypeError("acl 必须是 DocumentAcl 或 None")
@@ -49,6 +52,7 @@ class KnowledgeIndexer:
         self.delete_stale = delete_stale
         self.skip_existing = skip_existing
         self.acl = acl
+        self.metrics = metrics
 
     def index_chunks(
         self,
@@ -121,13 +125,30 @@ class KnowledgeIndexer:
             skipped += len(group_chunks) - len(to_embed)
 
             if to_embed:
-                vectors = self.embedding.embed_documents(
-                    [chunk.content for chunk in to_embed]
-                )
+                embedding_started_at = perf_counter()
+                try:
+                    vectors = self.embedding.embed_documents(
+                        [chunk.content for chunk in to_embed]
+                    )
+                except Exception:
+                    self._observe_embedding(
+                        outcome="error",
+                        started_at=embedding_started_at,
+                    )
+                    raise
                 if not vectors:
+                    self._observe_embedding(
+                        outcome="error",
+                        started_at=embedding_started_at,
+                    )
                     raise KnowledgeIndexError(
                         f"Embedding 未返回向量: {scope_field}={scope_value}"
                     )
+                self._observe_embedding(
+                    outcome="success",
+                    started_at=embedding_started_at,
+                    text_count=len(to_embed),
+                )
                 embedded += self.vector_store.upsert_chunks(
                     to_embed,
                     vectors,
@@ -159,6 +180,23 @@ class KnowledgeIndexer:
             embedded_chunks=embedded,
             skipped_chunks=skipped,
             stale_deleted=stale_deleted,
+        )
+
+    def _observe_embedding(
+        self,
+        *,
+        outcome: str,
+        started_at: float,
+        text_count: int = 0,
+    ) -> None:
+        if self.metrics is None:
+            return
+        self.metrics.observe_embedding(
+            model=self.embedding.model_name,
+            operation="documents",
+            outcome=outcome,
+            duration_seconds=perf_counter() - started_at,
+            text_count=text_count,
         )
 
     def index_documents(

@@ -5,6 +5,9 @@ import os
 import socket
 import threading
 import uuid
+from time import perf_counter
+
+from observability import RagMetrics
 
 from .KnowledgeIngestionService import KnowledgeIngestionService
 
@@ -23,6 +26,7 @@ class IngestionJobWorker:
         poll_seconds: float = 1.0,
         lease_seconds: int = 1800,
         max_attempts: int = 3,
+        metrics: RagMetrics | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds 必须为正数")
@@ -35,6 +39,7 @@ class IngestionJobWorker:
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
+        self.metrics = metrics
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -74,7 +79,14 @@ class IngestionJobWorker:
         self._thread = None
 
     def _run(self) -> None:
-        logger.info("知识构建 worker 已启动: %s", self.worker_id)
+        if self.metrics is not None:
+            self.metrics.set_worker_running(True)
+        logger.info(
+            "知识构建 worker 已启动: %s",
+            self.worker_id,
+            extra={"event": "ingestion.worker.start", "worker_id": self.worker_id},
+        )
+        self._refresh_queue_depth()
         try:
             while not self._stop_event.is_set():
                 try:
@@ -88,6 +100,7 @@ class IngestionJobWorker:
                     job = None
 
                 if job is None:
+                    self._refresh_queue_depth()
                     self._wake_event.wait(self.poll_seconds)
                     self._wake_event.clear()
                     continue
@@ -97,17 +110,66 @@ class IngestionJobWorker:
                     job.job_id,
                     job.document_id,
                     job.attempt_count,
+                    extra={
+                        "event": "ingestion.job.claim",
+                        "job_id": job.job_id,
+                        "document_id": job.document_id,
+                        "attempt": job.attempt_count,
+                        "worker_id": self.worker_id,
+                    },
                 )
+                started_at = perf_counter()
                 try:
-                    self.ingestion.run_job(
+                    completed = self.ingestion.run_job(
                         job.job_id,
                         worker_id=self.worker_id,
                         lease_seconds=self.lease_seconds,
                     )
                 except Exception:
+                    self._observe_job("failed", started_at)
                     logger.exception("知识构建任务执行失败: %s", job.job_id)
+                else:
+                    status = str(getattr(completed, "status", "unknown"))
+                    if status == "running":
+                        status = "lease_lost"
+                    self._observe_job(status, started_at)
+                finally:
+                    self._refresh_queue_depth()
         finally:
-            logger.info("知识构建 worker 已停止: %s", self.worker_id)
+            if self.metrics is not None:
+                self.metrics.set_worker_running(False)
+            logger.info(
+                "知识构建 worker 已停止: %s",
+                self.worker_id,
+                extra={
+                    "event": "ingestion.worker.stop",
+                    "worker_id": self.worker_id,
+                },
+            )
+
+    def _observe_job(self, status: str, started_at: float) -> None:
+        if self.metrics is not None:
+            self.metrics.observe_ingestion_job(
+                status=status,
+                duration_seconds=perf_counter() - started_at,
+            )
+
+    def _refresh_queue_depth(self) -> None:
+        if self.metrics is None or not self.metrics.enabled:
+            return
+        store = getattr(self.ingestion, "governance_store", None)
+        counter = getattr(store, "count_jobs_by_status", None)
+        if not callable(counter):
+            return
+        try:
+            counts = counter()
+        except Exception:
+            return
+        for status in ("pending", "running", "succeeded", "failed"):
+            self.metrics.set_ingestion_queue_depth(
+                status=status,
+                count=int(counts.get(status, 0)),
+            )
 
 
 __all__ = ["IngestionJobWorker"]

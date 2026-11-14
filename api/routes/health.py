@@ -22,7 +22,7 @@ async def health(request: Request) -> dict[str, str | None]:
 
 @router.get("/ready", summary="服务就绪检查")
 async def ready(request: Request) -> JSONResponse:
-    """检查检索索引、后台 worker 和管理服务是否已完成启动。"""
+    """检查检索索引、后台 worker、管理服务和外部依赖。"""
 
     state = request.app.state
     settings = getattr(state, "settings", None)
@@ -58,9 +58,37 @@ async def ready(request: Request) -> JSONResponse:
         and admin_error is None
     )
     worker_ready = (not worker_enabled) or (worker_running and admin_ready)
-    ready_status = search_ready and worker_ready
+    checker = getattr(state, "dependency_health_checker", None)
+    dependencies: dict[str, dict] = {}
+    if checker is not None:
+        try:
+            dependencies = await asyncio.to_thread(checker.check)
+        except Exception as exc:
+            dependencies = {
+                "health_checker": {
+                    "ready": False,
+                    "detail": "health_check_failed",
+                    "error": str(exc)[:500],
+                }
+            }
+    dependencies_ready = all(
+        bool(item.get("ready")) for item in dependencies.values()
+    )
+    dependency_required = bool(
+        getattr(settings, "rag_dependency_health_fail_readiness", False)
+    )
+    ready_status = (
+        search_ready
+        and worker_ready
+        and (dependencies_ready or not dependency_required)
+    )
 
-    status_text = "ready" if ready_status else "not_ready"
+    if not ready_status:
+        status_text = "not_ready"
+    elif not dependencies_ready:
+        status_text = "degraded"
+    else:
+        status_text = "ready"
     return JSONResponse(
         status_code=200 if ready_status else 503,
         content={
@@ -73,6 +101,8 @@ async def ready(request: Request) -> JSONResponse:
                 "ready": worker_ready,
             },
             "admin_service_ready": admin_ready,
+            "dependencies": dependencies,
+            "dependency_fail_readiness": dependency_required,
         },
     )
 

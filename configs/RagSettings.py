@@ -135,6 +135,18 @@ class RagSettings:
     rag_rerank_candidates: int = 30
     rag_expand_parent_context: bool = True
 
+    rag_log_level: str = "INFO"
+    rag_log_format: str = "json"
+    rag_access_log_enabled: bool = True
+    rag_metrics_enabled: bool = True
+    rag_warmup_embedding: bool = True
+    rag_dependency_health_cache_seconds: float = 15.0
+    rag_dependency_health_timeout_seconds: float = 2.0
+    rag_dependency_health_external_enabled: bool = True
+    rag_dependency_health_fail_readiness: bool = False
+    rag_dependency_health_llm_url: str | None = None
+    rag_dependency_health_embedding_url: str | None = None
+
     api_title: str = "Enterprise RAG API"
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
 
@@ -233,6 +245,32 @@ class RagSettings:
             raise ValueError("RAG_RERANK_MODEL 不能为空")
         if self.rag_rerank_candidates <= 0:
             raise ValueError("RAG_RERANK_CANDIDATES 必须为正整数")
+        if self.rag_log_format.strip().lower() not in {"json", "text"}:
+            raise ValueError("RAG_LOG_FORMAT 必须是 json 或 text")
+        if self.rag_log_level.strip().upper() not in {
+            "CRITICAL",
+            "ERROR",
+            "WARNING",
+            "INFO",
+            "DEBUG",
+        }:
+            raise ValueError(
+                "RAG_LOG_LEVEL 必须是 CRITICAL/ERROR/WARNING/INFO/DEBUG"
+            )
+        if self.rag_dependency_health_cache_seconds <= 0:
+            raise ValueError("RAG_DEPENDENCY_HEALTH_CACHE_SECONDS 必须为正数")
+        if self.rag_dependency_health_timeout_seconds <= 0:
+            raise ValueError("RAG_DEPENDENCY_HEALTH_TIMEOUT_SECONDS 必须为正数")
+        if (
+            self.rag_dependency_health_llm_url is not None
+            and not self.rag_dependency_health_llm_url.strip()
+        ):
+            raise ValueError("RAG_DEPENDENCY_HEALTH_LLM_URL 不能为空")
+        if (
+            self.rag_dependency_health_embedding_url is not None
+            and not self.rag_dependency_health_embedding_url.strip()
+        ):
+            raise ValueError("RAG_DEPENDENCY_HEALTH_EMBEDDING_URL 不能为空")
 
     @classmethod
     def from_env(cls) -> "RagSettings":
@@ -315,6 +353,29 @@ class RagSettings:
             rag_rerank_candidates=_env_int("RAG_RERANK_CANDIDATES", 30),
             rag_expand_parent_context=_env_bool(
                 "RAG_EXPAND_PARENT_CONTEXT", True
+            ),
+            rag_log_level=_env("RAG_LOG_LEVEL", "INFO"),
+            rag_log_format=_env("RAG_LOG_FORMAT", "json"),
+            rag_access_log_enabled=_env_bool("RAG_ACCESS_LOG_ENABLED", True),
+            rag_metrics_enabled=_env_bool("RAG_METRICS_ENABLED", True),
+            rag_warmup_embedding=_env_bool("RAG_WARMUP_EMBEDDING", True),
+            rag_dependency_health_cache_seconds=_env_float(
+                "RAG_DEPENDENCY_HEALTH_CACHE_SECONDS", 15.0
+            ),
+            rag_dependency_health_timeout_seconds=_env_float(
+                "RAG_DEPENDENCY_HEALTH_TIMEOUT_SECONDS", 2.0
+            ),
+            rag_dependency_health_external_enabled=_env_bool(
+                "RAG_DEPENDENCY_HEALTH_EXTERNAL_ENABLED", True
+            ),
+            rag_dependency_health_fail_readiness=_env_bool(
+                "RAG_DEPENDENCY_HEALTH_FAIL_READINESS", False
+            ),
+            rag_dependency_health_llm_url=_env_optional(
+                "RAG_DEPENDENCY_HEALTH_LLM_URL"
+            ),
+            rag_dependency_health_embedding_url=_env_optional(
+                "RAG_DEPENDENCY_HEALTH_EMBEDDING_URL"
             ),
             api_title=_env("API_TITLE", "Enterprise RAG API"),
             cors_origins=_env_list("API_CORS_ORIGINS"),

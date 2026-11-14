@@ -26,6 +26,7 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 - OpenAPI：`http://localhost:8080/docs`
 - 存活检查：`GET /health`
 - 就绪检查：`GET /ready`（索引或 worker 未就绪时返回 503）
+- 指标：`GET /metrics`（Prometheus）
 - 流式问答：`POST /v1/query`
 - 知识控制台：`GET /admin`
 
@@ -73,8 +74,14 @@ collection 不存在时自动创建向量集合。
 先完成建库建索引，否则 `/ready` 会持续返回 503。
 
 `/health` 只用于判断进程存活，不访问 Qdrant。`/ready` 会实时检查检索索引，
-并确认配置启用时构建 worker 与管理服务已经正常运行。负载均衡、Kubernetes
-readiness probe 和发布脚本应使用 `/ready`，避免在索引未完成时接流量。
+并确认配置启用时构建 worker 与管理服务已经正常运行，同时报告 Embedding / LLM
+依赖状态。负载均衡、Kubernetes readiness probe 和发布脚本应使用 `/ready`，
+避免在索引未完成时接流量。依赖不可用但核心索引正常时默认返回
+`200 + degraded`，可通过 `RAG_DEPENDENCY_HEALTH_FAIL_READINESS=true` 改为 503。
+
+`/metrics` 暴露 Prometheus 指标，建议只允许监控网络访问。HTTP、查询、检索、
+Embedding、LLM 和构建队列指标以及日志字段见
+[`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md)。
 
 ## 流式查询
 
