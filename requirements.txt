@@ -13,6 +13,7 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 httpx>=0.27,<1.0
 python-multipart>=0.0.9,<1.0
+prometheus-client>=0.21,<1.0
 
 # 文档解析：PDF / Word / PowerPoint / 表格
 pypdf>=5.0,<7.0

@@ -32,6 +32,12 @@ from knowledge_management import (
     KnowledgeGovernanceStore,
     KnowledgeIngestionService,
 )
+from observability import (
+    DependencyHealthChecker,
+    LoggingConfiguration,
+    RagMetrics,
+    RequestContextMiddleware,
+)
 from retrieval import (
     KnowledgeRetriever,
     PromptBuilder,
@@ -42,13 +48,17 @@ from retrieval.rerank import CrossEncoderReranker
 
 from .routes.admin import router as admin_router
 from .routes.health import router as health_router
+from .routes.metrics import router as metrics_router
 from .routes.query import router as query_router
 
 
 logger = logging.getLogger(__name__)
 
 
-def build_query_service(settings: RagSettings) -> RagQueryService:
+def build_query_service(
+    settings: RagSettings,
+    metrics: RagMetrics | None = None,
+) -> RagQueryService:
     """根据环境配置组装在线查询服务。"""
 
     embedding = _build_embedding(settings)
@@ -89,6 +99,7 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
             reranker=reranker,
             rerank_candidates=settings.rag_rerank_candidates,
             expand_parent_context=settings.rag_expand_parent_context,
+            metrics=metrics,
         ),
         llm,
         PromptBuilder(max_context_chars=settings.rag_max_context_chars),
@@ -96,12 +107,14 @@ def build_query_service(settings: RagSettings) -> RagQueryService:
         default_score_threshold=settings.rag_score_threshold,
         default_temperature=settings.llm_temperature,
         default_max_tokens=settings.llm_max_tokens,
+        metrics=metrics,
     )
 
 
 def build_admin_service(
     settings: RagSettings,
     query_service: RagQueryService | None = None,
+    metrics: RagMetrics | None = None,
 ) -> KnowledgeAdminService:
     """组装知识上传、构建、质量与审计服务。"""
 
@@ -124,7 +137,12 @@ def build_admin_service(
                 timeout=settings.llm_timeout,
             ),
         )
-    indexer = KnowledgeIndexer(embedding, vector_store, sync_scope="source")
+    indexer = KnowledgeIndexer(
+        embedding,
+        vector_store,
+        sync_scope="source",
+        metrics=metrics,
+    )
     ingestion = KnowledgeIngestionService(
         governance_store=KnowledgeGovernanceStore(settings.rag_governance_db_path),
         data_dir=settings.rag_upload_dir,
@@ -179,12 +197,18 @@ def create_app(
     """创建 FastAPI 应用；测试时可直接注入查询服务。"""
 
     resolved_settings = settings or RagSettings.from_env()
+    LoggingConfiguration.configure(
+        level=resolved_settings.rag_log_level,
+        log_format=resolved_settings.rag_log_format,
+    )
+    metrics = RagMetrics(enabled=resolved_settings.rag_metrics_enabled)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        runtime = service or build_query_service(resolved_settings)
+        runtime = service or build_query_service(resolved_settings, metrics=metrics)
         resolved_admin = admin_service
         app.state.admin_service_error = None
+        app.state.embedding_warmup_error = None
         worker_enabled = (
             resolved_settings.rag_ingestion_worker_enabled
             if job_worker_enabled is None
@@ -193,7 +217,10 @@ def create_app(
         if resolved_admin is None and worker_enabled:
             try:
                 resolved_admin = await asyncio.to_thread(
-                    build_admin_service, resolved_settings, runtime
+                    build_admin_service,
+                    resolved_settings,
+                    runtime,
+                    metrics,
                 )
             except Exception as exc:
                 logger.exception("知识管理服务启动初始化失败")
@@ -204,7 +231,13 @@ def create_app(
         app.state.admin_owned = admin_service is None and resolved_admin is not None
         app.state.ingestion_worker_enabled = worker_enabled
         app.state.job_worker = None
+        await _warmup_embedding(runtime, app, resolved_settings)
         await _bootstrap_search_indexes(runtime, app, resolved_settings)
+        app.state.dependency_health_checker = DependencyHealthChecker(
+            runtime,
+            resolved_settings,
+            metrics=metrics,
+        )
         worker: IngestionJobWorker | None = None
         if worker_enabled and resolved_admin is not None:
             worker = IngestionJobWorker(
@@ -212,6 +245,7 @@ def create_app(
                 poll_seconds=resolved_settings.rag_ingestion_poll_seconds,
                 lease_seconds=resolved_settings.rag_ingestion_lease_seconds,
                 max_attempts=resolved_settings.rag_ingestion_max_attempts,
+                metrics=metrics,
             )
             app.state.job_worker = worker
             worker.start()
@@ -238,6 +272,8 @@ def create_app(
     app.state.admin_service = admin_service
     app.state.admin_owned = admin_service is None
     app.state.job_worker = None
+    app.state.metrics = metrics
+    app.state.dependency_health_checker = None
     app.state.ingestion_worker_enabled = resolved_settings.rag_ingestion_worker_enabled
     app.state.search_index_status = {
         "ready": False,
@@ -246,6 +282,7 @@ def create_app(
     app.state.admin_service_factory = lambda: build_admin_service(
         resolved_settings,
         getattr(app.state, "query_service", None),
+        metrics,
     )
     if resolved_settings.cors_origins:
         allow_all = resolved_settings.cors_origins == ("*",)
@@ -255,8 +292,16 @@ def create_app(
             allow_credentials=not allow_all,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=["X-Request-ID", "X-Trace-ID"],
         )
+    app.add_middleware(
+        RequestContextMiddleware,
+        metrics=metrics,
+        access_log_enabled=resolved_settings.rag_access_log_enabled,
+    )
     app.include_router(health_router)
+    if resolved_settings.rag_metrics_enabled:
+        app.include_router(metrics_router)
     app.include_router(query_router)
     app.include_router(admin_router)
 
@@ -269,6 +314,26 @@ def create_app(
             return FileResponse(ui_dir / "index.html")
 
     return app
+
+
+async def _warmup_embedding(
+    runtime: RagQueryService,
+    app: FastAPI,
+    settings: RagSettings,
+) -> None:
+    if not settings.rag_warmup_embedding:
+        return
+    embedding = getattr(getattr(runtime, "retriever", None), "embedding", None)
+    if embedding is None or not hasattr(embedding, "is_loaded"):
+        return
+    if bool(getattr(embedding, "is_loaded", False)):
+        return
+    try:
+        await asyncio.to_thread(lambda: embedding.dimension)
+        logger.info("Embedding 模型预热完成", extra={"event": "embedding.warmup"})
+    except Exception as exc:
+        app.state.embedding_warmup_error = exc
+        logger.exception("Embedding 模型预热失败")
 
 
 async def _bootstrap_search_indexes(

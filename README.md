@@ -28,6 +28,9 @@ uvicorn api.app:app --host 0.0.0.0 --port 8080
 流式查询接口为 `POST /v1/query`，知识入库控制台位于 `/admin`，OpenAPI
 文档位于 `/docs`。`GET /health` 只检查进程存活；`GET /ready` 会检查 Qdrant
 collection、ACL/BM25 索引、构建 worker 和管理服务，未就绪时返回 503。
+`GET /metrics` 暴露 Prometheus 指标，默认输出带 `request_id` / `trace_id` 的
+JSON 日志；依赖降级和第一阶段观测配置见
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)。
 
 生产启动时默认自动创建缺失的 Qdrant collection，并补齐 `tenant_id`、ACL 字段
 和 BM25 文本索引。构建任务由持久化 SQLite worker 通过租约领取，进程重启后会

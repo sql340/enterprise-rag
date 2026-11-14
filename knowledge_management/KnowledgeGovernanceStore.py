@@ -95,6 +95,8 @@ class KnowledgeGovernanceStore:
                     ON knowledge_documents(tenant_id, status, quality_status);
                 CREATE INDEX IF NOT EXISTS idx_knowledge_jobs_tenant
                     ON knowledge_jobs(tenant_id, document_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_jobs_status
+                    ON knowledge_jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_knowledge_audit_tenant
                     ON knowledge_audit_events(tenant_id, created_at);
                 """
@@ -477,6 +479,19 @@ class KnowledgeGovernanceStore:
                 values,
             ).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def count_jobs_by_status(self) -> dict[str, int]:
+        """返回全局任务数量，用于 worker 队列指标。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM knowledge_jobs
+                GROUP BY status
+                """
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def record_audit(self, event: AuditEvent) -> int:
         with self._lock, self._connection:
